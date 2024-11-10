@@ -569,8 +569,8 @@ class ThrowingOfstream : public std::ofstream {
 
 
     void write_string_with_size(const std::string &s) {
-        u64 size = reinterpret_cast<u64>(s.size());
-        std::ofstream::write(reinterpret_cast<char *>(&size), sizeof(u64));
+        size_t size = reinterpret_cast<size_t>(s.size());
+        std::ofstream::write(reinterpret_cast<char *>(&size), sizeof(size_t));
         (*this) << s;
     }
 };
@@ -617,7 +617,5 @@ class ThrowingIfstream : public std::ifstream {
     }
 
 };
-
-
 
 // clang-format on
