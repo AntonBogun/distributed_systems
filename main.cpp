@@ -12,7 +12,7 @@
 
 const TimeValue NO_DELAY{0.0};
 
-#define DEBUG_PRINTS 1
+#define DEBUG_PRINTS 0
 
 
 static std::mutex io_mutex;
@@ -175,10 +175,13 @@ class TransmissionLayer{
     //% NOTE: this can be less than TRANSMISSION_LAYER_HEADER (by at most CONTINUITY_LEN (-1?))
     //% when performing continuity merge
     int total_read = TRANSMISSION_LAYER_HEADER;
-    //MAX_MESSAGE_SIZE - total_received
-    inline int remaining_in_buf() const { return MAX_MESSAGE_SIZE - total_received; }
     //MAX_MESSAGE_SIZE - total_written
-    inline int remaining_out_buf() const { return MAX_MESSAGE_SIZE - total_written; }
+    inline int remaining_out_buf_to_write() const { return MAX_MESSAGE_SIZE - total_written; }
+    //MAX_MESSAGE_SIZE - total_read
+    //% NOTICE: this uses total_written instead of total_written as with out_buf_to_write
+    //% this is because read.. cares about remaining *received* space in the buffer
+    //% while write.. cares about remaining *free* space in the buffer
+    inline int remaining_in_buf_to_read() const { return MAX_MESSAGE_SIZE - total_read; }
 
     i64 batches_sent = 0;
     i64 batches_received = 0;
@@ -261,18 +264,18 @@ class TransmissionLayer{
     //% true if error
     [[nodiscard]]
     bool send_if_dont_fit(const char* stream, int size){
-        int offset=0;
-        while(size > remaining_out_buf()){//send loop
-            DEBUG_PRINT(prints_new("send:", size, ">", remaining_out_buf(),"written:", total_written));
+        while(size > remaining_out_buf_to_write()){//send loop
+            int remaining = remaining_out_buf_to_write();
+            DEBUG_PRINT(prints_new("send:", size, ">", remaining,"written:", total_written));
             // std::memcpy(sock.out_buffer.data()+total_written, stream, remaining_out_buf());
-            std::memcpy(out_buf_at(total_written), stream, remaining_out_buf());
-            size-=remaining_out_buf();
-            offset+=remaining_out_buf();
-            total_written+=remaining_out_buf();
+            std::memcpy(out_buf_at(total_written), stream, remaining);
+            size-=remaining;//subtract written
+            stream+=remaining;//move pointer forward
+            total_written+=remaining;//finish up the buffer
             if (construct_and_send(1)) return true;
         }
         if(size>0){
-            std::memcpy(out_buf_at(total_written), stream+offset, size);
+            std::memcpy(out_buf_at(total_written), stream, size);
             total_written+=size;
         }
         return false;
@@ -386,14 +389,16 @@ class TransmissionLayer{
         //trying to read more than the protocol allows
         throw_if(!recv_batch_continue && total_read+size>total_received, 
             prints_new("Size mismatch on recv_if_not_enough: size=",size,",", total_read+size, " > ", total_received));
-        if(size > remaining_in_buf()){//have to read more
+        if(size > remaining_in_buf_to_read()){//have to read more
             //protocol error
             throw_if(!recv_batch_continue, "Unexpected batches continue == 0 on recv_if_not_enough");
-            auto continuity = remaining_in_buf();
+            auto continuity = remaining_in_buf_to_read(); 
+            DEBUG_PRINT(prints_new("Continuity read: ", continuity));
             if(recv_new_batch(1)){
                 return true;
             }
-            total_read -= continuity;//places read pointer into the continuity segment copied from the previous batch
+            //places read pointer backward into the continuity segment copied from the previous batch
+            total_read -= continuity;
         }
         return false;
     }
@@ -548,7 +553,7 @@ class TransmissionLayer{
         //need to make a loop since string may be larger than remaining_in_buf
         int read = 0;
         while(read<size){
-            int to_read = min(size-read, remaining_in_buf());
+            int to_read = min(size-read, remaining_in_buf_to_read());
             std::memcpy(&str[read], in_buf_at(total_read), to_read);
             total_read+=to_read;
             read+=to_read;
@@ -776,7 +781,7 @@ int main()
     int server_fd = server_socket.get_socket_fd();
 
     // Create thread for server and client service
-    int vector_n=10000;
+    int vector_n=100000;
     auto server_thread = std::thread(
         [&server_socket, &server_fd, vector_n]()
         {
@@ -799,7 +804,8 @@ int main()
             printcout(prints_new("Sum: ", sum));
             printcout("sending vector");
             for(int i=0;i<vector_n;i++){
-                TL_ERR_and_return(tl.write_i32(v[i]), tl.print_errors());
+                TL_ERR_and_return(tl.write_i32(v[i]),
+                 {printcout(prints_new("break at i",i)); tl.print_errors();});
             }
             TL_ERR_and_return(tl.finalize_send(), tl.print_errors());
 
