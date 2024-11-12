@@ -134,9 +134,10 @@ std::string timeval_to_string(struct timeval tv){
 }
 //in seconds
 //both for duration and timepoints
+extern const TimeValue NO_DELAY;
 struct TimeValue{
     double time;
-    explicit TimeValue(double t): time(t){}
+    TimeValue(double t): time(t){}
     explicit TimeValue(struct timeval tv): 
     time(static_cast<double>(tv.tv_sec)+static_cast<double>(tv.tv_usec)/1e6){}
     static TimeValue now() {
@@ -175,8 +176,16 @@ struct TimeValue{
     TimeValue operator+(TimeValue other){
         return TimeValue(time+other.time);
     }
+    TimeValue operator+=(TimeValue other){
+        time+=other.time;
+        return *this;
+    }
     TimeValue operator-(TimeValue other){
         return TimeValue(time-other.time);
+    }
+    TimeValue operator-=(TimeValue other){
+        time-=other.time;
+        return *this;
     }
     TimeValue operator*(double other){
         return TimeValue(time*other);
@@ -221,4 +230,16 @@ void set_socket_options_throw(int socket_fd)
              prints_new("Failed to set SO_REUSEPORT, errno:", errno));
     throw_if(setsockopt(socket_fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt)) < 0,
              prints_new("Failed to set SO_KEEPALIVE, errno:", errno));
+}
+
+//% true means error + errno set
+[[nodiscard]]
+bool set_socket_send_timeout(int socket_fd, TimeValue timeout){
+    struct timeval tv = timeout.to_timeval();
+    return setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0;
+}
+[[nodiscard]]
+bool set_socket_recv_timeout(int socket_fd, TimeValue timeout){
+    struct timeval tv = timeout.to_timeval();
+    return setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0;
 }
