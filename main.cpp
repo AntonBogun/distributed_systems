@@ -1,17 +1,18 @@
 #include "utils.h"
+#include "sockets.h"
 #include <algorithm>
-#include <arpa/inet.h>
 #include <cstring>
 #include <fstream>
-#include <ifaddrs.h>
 #include <iostream>
 #include <mutex>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/types.h>
 #include <thread>
-#include <unistd.h>
 #include <vector>
+#include <queue>
+#include <chrono>
+
+
+
+
 
 static std::mutex io_mutex;
 // safely print to cout on multiple threads
@@ -28,144 +29,16 @@ static std::mutex io_mutex;
         std::cout << x << std::endl;                \
     } while (0)
 
-struct ipv4_addr
-{
-    u8 a;
-    u8 b;
-    u8 c;
-    u8 d;
-    ipv4_addr() : a(0), b(0), c(0), d(0) {}
-    ipv4_addr(u8 a_, u8 b_, u8 c_, u8 d_) : a(a_), b(b_), c(c_), d(d_) {}
-    static ipv4_addr from_in_addr(struct in_addr addr)
-    {
-        ipv4_addr ip;
-        ip.a = addr.s_addr & 0xFF; // reverse order, host is little endian but network is big endian
-        ip.b = (addr.s_addr >> 8) & 0xFF;
-        ip.c = (addr.s_addr >> 16) & 0xFF;
-        ip.d = (addr.s_addr >> 24) & 0xFF;
-        return ip;
-    }
-    struct in_addr to_in_addr()
-    {
-        struct in_addr addr;
-        addr.s_addr = a | (b << 8) | (c << 16) | (d << 24);
-        return addr;
-    }
-    bool operator==(ipv4_addr other) const
-    {
-        return a == other.a && b == other.b && c == other.c && d == other.d;
-    }
-    bool operator!=(ipv4_addr other) const
-    {
-        return !(*this == other);
-    }
-};
 
-std::string ip_to_string(ipv4_addr ip)
-{
-    std::stringstream ss;
-    ss << (int)ip.a << "." << (int)ip.b << "." << (int)ip.c << "." << (int)ip.d;
-    return ss.str();
-}
-std::string ip_to_string(struct in_addr addr)
-{
-    char buffer[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &addr, buffer, INET_ADDRSTRLEN);
-    return std::string(buffer);
-}
-struct socket_address
-{
-    ipv4_addr ip;
-    in_port_t port;
-    socket_address() : ip(), port(0) {}
-    socket_address(ipv4_addr ip_, in_port_t port_) : ip(ip_), port(port_) {}
-    socket_address(u8 a, u8 b, u8 c, u8 d, in_port_t port_) : ip(a, b, c, d), port(port_) {}
-    static socket_address from_sockaddr_in(struct sockaddr_in addr)
-    {
-        socket_address saddr;
-        saddr.ip = ipv4_addr::from_in_addr(addr.sin_addr);
-        saddr.port = ntohs(addr.sin_port);
-        return saddr;
-    }
-    static socket_address from_fd_local(int fd)
-    {
-        struct sockaddr_in addr;
-        socklen_t len = sizeof(addr);
-        getsockname(fd, (struct sockaddr *)&addr, &len);
-        return from_sockaddr_in(addr);
-    }
-    static socket_address from_fd_remote(int fd)
-    {
-        struct sockaddr_in addr;
-        socklen_t len = sizeof(addr);
-        getpeername(fd, (struct sockaddr *)&addr, &len);
-        return from_sockaddr_in(addr);
-    }
-    struct sockaddr_in to_sockaddr_in()
-    {
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_addr = ip.to_in_addr();
-        addr.sin_port = htons(port);
-        return addr;
-    }
-    bool operator==(socket_address other) const
-    {
-        return ip == other.ip && port == other.port;
-    }
-    bool operator!=(socket_address other) const
-    {
-        return !(*this == other);
-    }
-};
-std::string socket_address_to_string(socket_address addr)
-{
-    std::stringstream ss;
-    ss << ip_to_string(addr.ip) << ":" << addr.port;
-    return ss.str();
-}
-std::string socket_address_to_string(struct sockaddr_in addr)
-{
-    std::stringstream ss;
-    ss << ip_to_string(addr.sin_addr) << ":" << ntohs(addr.sin_port);
-    return ss.str();
-}
-// void throw_if(bool condition, const std::string &message){
-//     if (condition) {
-//         throw std::runtime_error(message);
-//     }
-// }
-#define throw_if(condition, message)       \
-    if (condition)                         \
-    {                                      \
-        throw std::runtime_error(message); \
-    }
-
-int create_socket()
-{
-    int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    throw_if(socket_fd < 0, prints_new("Failed to create socket, errno:", errno));
-    return socket_fd;
-}
-void set_socket_options(int socket_fd)
-{
-    int opt = 1;
-    throw_if(setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0,
-             prints_new("Failed to set SO_REUSEADDR, errno:", errno));
-    throw_if(setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0,
-             prints_new("Failed to set SO_REUSEPORT, errno:", errno));
-    throw_if(setsockopt(socket_fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt)) < 0,
-             prints_new("Failed to set SO_KEEPALIVE, errno:", errno));
-}
 
 static_assert(sizeof(int) == sizeof(i32), "int and i32 must be the same size");
 
+
 constexpr in_port_t DEFAULT_PORT = 8080;
-constexpr int MESSAGE_DATA_OFFSET = sizeof(int);
-constexpr int MAX_MESSAGE_SIZE = 1024;
-constexpr int MAX_MESSAGE_DATA_SIZE = MAX_MESSAGE_SIZE - MESSAGE_DATA_OFFSET;
+constexpr int MAX_MESSAGE_SIZE = 4096;
 constexpr int BACKLOG = 5;
-#if 1
+#define DO_SOCKETS 0
+#if DO_SOCKETS
 enum SOCKET_TYPE
 {
     CLIENT,
@@ -178,14 +51,6 @@ public:
 
     FCVector<char> in_buffer;
     FCVector<char> out_buffer;
-    int total_read = 0;
-    int total_received = 0;
-    int total_sent = 0;
-    int total_written = 0;
-    inline int remaining_read() const { return total_received - total_read; }
-    inline int remaining_write() const { return total_written - total_sent; }
-    inline int remaining_in_buf() const { return MAX_MESSAGE_SIZE - total_read; }
-    inline int remaining_out_buf() const { return MAX_MESSAGE_SIZE - total_sent; }
 
     int allocated_fd; // file descriptor associated with socket
     socket_address other_address;
@@ -225,9 +90,9 @@ public:
         throw_if(valid, "Cannot connect, socket already valid");
 
         // create new file descriptor and then connect binds it to free port
-        allocated_fd = create_socket();
+        allocated_fd = create_socket_throw();
 
-        set_socket_options(allocated_fd);
+        set_socket_options_throw(allocated_fd);
 
         struct sockaddr_in server_address = address.to_sockaddr_in();
 
@@ -245,83 +110,6 @@ public:
                                " from client: ", socket_address_to_string(socket_address::from_fd_local(allocated_fd))));
         valid = true;
     }
-
-    //! Note: does not check validity of socket
-    //! Note: does not reset buffer so it should be large enough to hold the message
-    void read_until(int size)
-    {
-        throw_if(!valid, "Socket not valid");
-        throw_if(size > MAX_MESSAGE_SIZE - total_read,
-                 prints_new("Message too large: ", size, " > ", MAX_MESSAGE_SIZE - total_read, "total_read: ", total_read));
-
-        int to_receive = size - remaining_read();
-        while (to_receive > 0)
-        {
-            //! danger: to_receive = remaining_in_buf() could read the next message
-            int valread = recv(allocated_fd, in_buffer.data() + total_received, to_receive, 0);
-            // printcout(prints_new("valread: ",valread));//!debug
-            throw_if(valread < 0, prints_new("Failed to read message, errno:", errno));
-            // TODO: timeout + block if valread == 0
-            total_received += valread;
-            to_receive -= valread;
-        }
-        total_read += size;
-    }
-    void read_message()
-    {
-        throw_if(!valid, "Socket not valid");
-        total_read = 0;
-        total_received = 0;
-
-        read_until(MESSAGE_DATA_OFFSET);
-        int message_size;
-        std::memcpy(&message_size, in_buffer.data(), MESSAGE_DATA_OFFSET);
-
-        throw_if(message_size > MAX_MESSAGE_DATA_SIZE, "Message too large");
-        throw_if(message_size < 0, "Invalid message size");
-
-        read_until(message_size);
-        MUTEX_PRINT(prints_new("Received message of length", message_size, "from: ", socket_address_to_string(other_address)));
-
-        std::stringstream ss;
-        for (int i = 0; i < message_size; ++i)
-        {
-            ss << in_buffer[i + MESSAGE_DATA_OFFSET];
-        }
-        MUTEX_PRINT(ss.str());
-    }
-    //! Note: does not check validity of socket
-    //! Note: does not reset buffer so it should be large enough to hold the message
-    void send_until(int size)
-    {
-        throw_if(size > MAX_MESSAGE_SIZE - total_sent,
-                 prints_new("Message too large: ", size, " > ", MAX_MESSAGE_SIZE - total_sent, "total_sent: ", total_sent));
-
-        int to_send = size - remaining_write();
-        while (to_send > 0)
-        {
-            int valsend = send(allocated_fd, out_buffer.data() + total_written, to_send, 0);
-            // TODO: timeout + block if valsend == 0
-            throw_if(valsend < 0, prints_new("Failed to send message, errno:", errno));
-            total_written += valsend;
-            to_send -= valsend;
-        }
-        total_sent += size;
-    }
-    void send_message(const std::string &message)
-    {
-        throw_if(!valid, "Socket not valid");
-        throw_if(message.size() > MAX_MESSAGE_DATA_SIZE, "Message too large"); // TODO: support longer messages
-
-        total_sent = 0;
-        total_written = 0;
-
-        int message_size = message.size();
-        std::memcpy(out_buffer.data(), &message_size, MESSAGE_DATA_OFFSET);
-        std::memcpy(out_buffer.data() + MESSAGE_DATA_OFFSET, message.c_str(), message.size());
-        send_until(message_size + MESSAGE_DATA_OFFSET);
-        MUTEX_PRINT(prints_new("Sent message of length", message_size, "to: ", socket_address_to_string(other_address)));
-    }
     ~OpenSocket()
     {
         if (valid)
@@ -330,6 +118,190 @@ public:
         }
     }
 };
+constexpr int TRANSMISSION_LAYER_INFO = sizeof(int)+sizeof(bool);//datalen + batches_continue
+constexpr int CONTINUITY_LEN = sizeof(u64);//continuity between batches
+constexpr int TRANSMISSION_LAYER_HEADER = TRANSMISSION_LAYER_INFO+CONTINUITY_LEN;
+constexpr int MAX_DATA_SIZE = MAX_MESSAGE_SIZE - TRANSMISSION_LAYER_HEADER;
+enum class error_code{
+    NO_ERROR=0,
+    MAX_BATCH_SEND_TIME=1,
+    SINCE_LAST_NON0_TIMEOUT=2,
+    SOCKET_ERROR=3
+};
+class TransmitionLayer{
+    //=layer description:
+    // i32 batch size
+    // bool batches continue
+    public:
+    OpenSocket& sock;
+    FCVector<u8> continuity_buffer;
+    int total_written = 0;//actual buf size
+    int total_received = 0;//actual buf size
+    int total_sent = 0;//logical sent size
+    int total_read = 0;//logical read size
+    inline int remaining_in_buf() const { return MAX_MESSAGE_SIZE - total_received; }
+    inline int remaining_out_buf() const { return MAX_MESSAGE_SIZE - total_written; }
+
+    double since_last_non0_timeout = 10;//timeout after this many seconds of no data
+    double min_data_throughput_limit = 4000;//bytes per second
+    i32 min_data_throughput_batch_size = 2000;//bytes, how large a batch should be to be considered for throughput limit
+    double last_batches = 30;//how many batches until we start checking for throughput limit
+    std::queue<std::pair<double,i32>> batch_send_info;
+    double max_batch_send_time = 30;//timeout after this many seconds of sending one batch
+    std::pair<double,i64> batch_send_info_cumulative = {0,0};
+
+    [[nodiscard]]
+    bool update_throughput_queue(double time, i32 size){
+        if(size>=min_data_throughput_batch_size){
+            batch_send_info.push({time,size});
+            batch_send_info_cumulative.first+=time;
+            batch_send_info_cumulative.second+=size;
+            while(batch_send_info.size()>last_batches){
+                auto front = batch_send_info.front();
+                batch_send_info.pop();
+                batch_send_info_cumulative.first-=front.first;
+                batch_send_info_cumulative.second-=front.second;
+            }
+            if(batch_send_info.size()>=last_batches){
+                double throughput = batch_send_info_cumulative.second;
+                if(throughput/batch_send_info_cumulative.first<min_data_throughput_limit){
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    void clear_throughput_queue(){
+        while(!batch_send_info.empty()){
+            batch_send_info.pop();
+        }
+        batch_send_info_cumulative = {0,0};
+    }
+
+    error_code last_error = error_code::NO_ERROR;
+
+    TransmitionLayer(OpenSocket& sock_):
+        sock(sock_),
+        continuity_buffer(CONTINUITY_LEN, 0){
+            throw_if(!sock.valid, "Socket not valid on TransmitionLayer creation");
+        }
+    
+    [[nodiscard]]
+    bool send_if_dont_fit(char* stream, int size){
+        if(size > remaining_out_buf()){
+            std::memcpy(sock.out_buffer.data()+total_written, stream, remaining_out_buf());
+            size-=remaining_out_buf();
+            stream+=remaining_out_buf();
+            total_written+=remaining_out_buf();
+            if (construct_and_send(1)) return true;
+        }
+        std::memcpy(sock.out_buffer.data()+total_written, stream, size);
+
+    }
+    inline char* out_buf_at(int offset){
+        return sock.out_buffer.data()+offset;
+    }
+    inline char* in_buf_at(int offset){
+        return sock.in_buffer.data()+offset;
+    }
+    [[nodiscard]]
+    bool construct_and_send(bool batches_continue){
+        throw_if(!sock.valid, "Socket not valid on construct_and_send");
+        const int data_len = total_written-TRANSMISSION_LAYER_HEADER;
+        throw_if(batches_continue&&data_len!=MAX_DATA_SIZE, 
+            prints_new("Data length mismatch on construct_and_send:", data_len, " != ", MAX_DATA_SIZE));
+        std::memcpy(out_buf_at(0), &data_len, sizeof(int));
+        std::memset(out_buf_at(sizeof(int)), batches_continue, sizeof(bool));
+        std::memcpy(out_buf_at(TRANSMISSION_LAYER_INFO), continuity_buffer.data(), CONTINUITY_LEN);
+        send_n(total_written);
+            
+    }
+    void write_byte(u8 byte){
+        out_buffer[total_written++] = byte;
+    }
+
+    //! Note: Does not do any checks:
+    // - does not check validity of socket
+    // - does not reset buffer so it should be large enough to hold the message
+    // - does not check if the message is too large
+    [[nodiscard]]
+    bool send_n(int to_send)
+    {
+        auto start = timenow();
+        while (to_send > 0)
+        {
+            int valsend = send(sock.allocated_fd, out_buf_at(total_sent), to_send, 0);
+            // TODO: timeout + block if valsend == 0
+            throw_if(valsend < 0, prints_new("Failed to send message, errno:", errno));
+            total_sent += valsend;
+            to_send -= valsend;
+        }
+        total_sent += size;
+    }
+
+    //! Note: does not check validity of socket
+    //! Note: does not reset buffer so it should be large enough to hold the message
+    void read_until(int size)
+    {
+        throw_if(size > MAX_MESSAGE_SIZE - total_read,
+                 prints_new("Message too large: ", size, " > ", MAX_MESSAGE_SIZE - total_read, "total_read: ", total_read));
+
+        int to_receive = size - remaining_read();
+        while (to_receive > 0)
+        {
+            //! danger: to_receive = remaining_in_buf() could read the next message
+            int valread = recv(sock.allocated_fd, sock.in_buffer.data() + total_received, to_receive, 0);
+            // printcout(prints_new("valread: ",valread));//!debug
+            throw_if(valread < 0, prints_new("Failed to read message, errno:", errno));
+            // TODO: timeout + block if valread == 0
+            total_received += valread;
+            to_receive -= valread;
+        }
+        total_read += size;
+    }
+
+
+
+    void read_message()
+    {
+        throw_if(!sock.valid, "Socket not valid");
+        total_read = 0;
+        total_received = 0;
+
+        read_until(MESSAGE_DATA_OFFSET);
+        int message_size;
+        std::memcpy(&message_size, sock.in_buffer.data(), MESSAGE_DATA_OFFSET);
+
+        throw_if(message_size > MAX_MESSAGE_DATA_SIZE, "Message too large");
+        throw_if(message_size < 0, "Invalid message size");
+
+        read_until(message_size);
+        MUTEX_PRINT(prints_new("Received message of length", message_size, "from: ", socket_address_to_string(sock.other_address)));
+
+        std::stringstream ss;
+        for (int i = 0; i < message_size; ++i)
+        {
+            ss << sock.in_buffer[i + MESSAGE_DATA_OFFSET];
+        }
+        MUTEX_PRINT(ss.str());
+    }
+    void send_message(const std::string &message)
+    {
+        throw_if(!sock.valid, "Socket not valid");
+        throw_if(message.size() > MAX_MESSAGE_DATA_SIZE, "Message too large"); // TODO: support longer messages
+
+        total_sent = 0;
+        total_written = 0;
+
+        int message_size = message.size();
+        std::memcpy(sock.out_buffer.data(), &message_size, MESSAGE_DATA_OFFSET);
+        std::memcpy(sock.out_buffer.data() + MESSAGE_DATA_OFFSET, message.c_str(), message.size());
+        send_until(message_size + MESSAGE_DATA_OFFSET);
+        MUTEX_PRINT(prints_new("Sent message of length", message_size, "to: ", socket_address_to_string(sock.other_address)));
+    }
+};
+
+
 class ServerSocket
 {
     int socket_fd;
@@ -339,9 +311,9 @@ public:
     ServerSocket(in_port_t port)
     {
 
-        socket_fd = create_socket();
+        socket_fd = create_socket_throw();
 
-        set_socket_options(socket_fd);
+        set_socket_options_throw(socket_fd);
 
         // struct sockaddr_in server_address;
         // server_address.sin_family = AF_INET;
@@ -501,6 +473,14 @@ int main()
 
     in_port_t port = 8080;
     printcout(prints_new("Using Server Port: ", port));
+    TimeValue tv=TimeValue::now();
+    printcout(prints_new("Time: ", tv.to_duration_string()));
+    printcout(prints_new("Date: ", tv.to_date_string()));
+    TimeValue tv2=TimeValue(1.5);
+    printcout(prints_new("Duration: ", tv2.to_duration_string()));
+    TimeValue tv3=TimeValue(-0.4);
+    printcout(prints_new("Duration: ", tv3.to_duration_string()));
+    #if DO_SOCKETS
     ServerSocket server_socket(port);
     int server_fd = server_socket.get_socket_fd();
 
@@ -535,6 +515,7 @@ int main()
 
     server_thread.join();
     client_thread.join();
+    #endif
 
     return 0;
 }
