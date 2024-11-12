@@ -8,3 +8,6 @@ main:
 
 clear:
 	rm -f bin/*
+
+run:
+	./${BIN}/main

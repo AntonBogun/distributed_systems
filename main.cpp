@@ -1,30 +1,17 @@
 #include "utils.h"
+#include "sockets.h"
 #include <algorithm>
-#include <arpa/inet.h>
 #include <cstring>
 #include <fstream>
-#include <ifaddrs.h>
 #include <iostream>
 #include <mutex>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/types.h>
 #include <thread>
-#include <unistd.h>
 #include <vector>
 #include <queue>
 #include <chrono>
 
 
-auto timenow(){
-  return std::chrono::high_resolution_clock::now();
-}
-auto timeinsec(std::chrono::high_resolution_clock::duration t){
-  return std::chrono::duration<double>(t);
-}
-auto timeinmsec(std::chrono::high_resolution_clock::duration t){
-  return std::chrono::duration<double, std::milli>(t);
-}
+
 
 
 static std::mutex io_mutex;
@@ -42,164 +29,16 @@ static std::mutex io_mutex;
         std::cout << x << std::endl;                \
     } while (0)
 
-struct ipv4_addr
-{
-    u8 a;
-    u8 b;
-    u8 c;
-    u8 d;
-    ipv4_addr() : a(0), b(0), c(0), d(0) {}
-    ipv4_addr(u8 a_, u8 b_, u8 c_, u8 d_) : a(a_), b(b_), c(c_), d(d_) {}
-    static ipv4_addr from_in_addr(struct in_addr addr)
-    {
-        ipv4_addr ip;
-        ip.a = addr.s_addr & 0xFF; // reverse order, host is little endian but network is big endian
-        ip.b = (addr.s_addr >> 8) & 0xFF;
-        ip.c = (addr.s_addr >> 16) & 0xFF;
-        ip.d = (addr.s_addr >> 24) & 0xFF;
-        return ip;
-    }
-    struct in_addr to_in_addr()
-    {
-        struct in_addr addr;
-        addr.s_addr = a | (b << 8) | (c << 16) | (d << 24);
-        return addr;
-    }
-    bool operator==(ipv4_addr other) const
-    {
-        return a == other.a && b == other.b && c == other.c && d == other.d;
-    }
-    bool operator!=(ipv4_addr other) const
-    {
-        return !(*this == other);
-    }
-};
 
-std::string ip_to_string(ipv4_addr ip)
-{
-    std::stringstream ss;
-    ss << (int)ip.a << "." << (int)ip.b << "." << (int)ip.c << "." << (int)ip.d;
-    return ss.str();
-}
-std::string ip_to_string(struct in_addr addr)
-{
-    char buffer[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &addr, buffer, INET_ADDRSTRLEN);
-    return std::string(buffer);
-}
-struct socket_address
-{
-    ipv4_addr ip;
-    in_port_t port;
-    socket_address() : ip(), port(0) {}
-    socket_address(ipv4_addr ip_, in_port_t port_) : ip(ip_), port(port_) {}
-    socket_address(u8 a, u8 b, u8 c, u8 d, in_port_t port_) : ip(a, b, c, d), port(port_) {}
-    static socket_address from_sockaddr_in(struct sockaddr_in addr)
-    {
-        socket_address saddr;
-        saddr.ip = ipv4_addr::from_in_addr(addr.sin_addr);
-        saddr.port = ntohs(addr.sin_port);
-        return saddr;
-    }
-    static socket_address from_fd_local(int fd)
-    {
-        struct sockaddr_in addr;
-        socklen_t len = sizeof(addr);
-        getsockname(fd, (struct sockaddr *)&addr, &len);
-        return from_sockaddr_in(addr);
-    }
-    static socket_address from_fd_remote(int fd)
-    {
-        struct sockaddr_in addr;
-        socklen_t len = sizeof(addr);
-        getpeername(fd, (struct sockaddr *)&addr, &len);
-        return from_sockaddr_in(addr);
-    }
-    struct sockaddr_in to_sockaddr_in()
-    {
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_addr = ip.to_in_addr();
-        addr.sin_port = htons(port);
-        return addr;
-    }
-    bool operator==(socket_address other) const
-    {
-        return ip == other.ip && port == other.port;
-    }
-    bool operator!=(socket_address other) const
-    {
-        return !(*this == other);
-    }
-};
-std::string socket_address_to_string(socket_address addr)
-{
-    std::stringstream ss;
-    ss << ip_to_string(addr.ip) << ":" << addr.port;
-    return ss.str();
-}
-std::string socket_address_to_string(struct sockaddr_in addr)
-{
-    std::stringstream ss;
-    ss << ip_to_string(addr.sin_addr) << ":" << ntohs(addr.sin_port);
-    return ss.str();
-}
-// void throw_if(bool condition, const std::string &message){
-//     if (condition) {
-//         throw std::runtime_error(message);
-//     }
-// }
-#define throw_if(condition, message)       \
-    if (condition)                         \
-    {                                      \
-        throw std::runtime_error(message); \
-    }
-
-int create_socket()
-{
-    int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    throw_if(socket_fd < 0, prints_new("Failed to create socket, errno:", errno));
-    return socket_fd;
-}
-void set_socket_options(int socket_fd)
-{
-    int opt = 1;
-    throw_if(setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0,
-             prints_new("Failed to set SO_REUSEADDR, errno:", errno));
-    throw_if(setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0,
-             prints_new("Failed to set SO_REUSEPORT, errno:", errno));
-    throw_if(setsockopt(socket_fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt)) < 0,
-             prints_new("Failed to set SO_KEEPALIVE, errno:", errno));
-}
 
 static_assert(sizeof(int) == sizeof(i32), "int and i32 must be the same size");
-
-
-template <typename impl, typename InnerProtocol, typename WriteOwner>
-class ProtocolWrapper{
-    // The protocol being wrapped, the wrapper gets to define the prefix and suffix functions 
-    // that will be called before/after the inner protocol's body
-    InnerProtocol inner_protocol;
-    // The owner of the write function, it is expected to have write_byte(),write_u64() etc.
-    // The owner gets control over what to do before/after the data is written in the buffer to correctly maintain it
-    WriteOwner& write_owner;
-    public:
-    ProtocolWrapper(InnerProtocol&& inner_protocol_, WriteOwner& write_owner_):
-        inner_protocol(inner_protocol_),    write_owner(write_owner_){}
-    void prefix(){};//nothing by default
-    void suffix(){};//nothing by default
-    void body(){
-        static_cast<impl*>(this)->prefix();
-        inner_protocol.body();
-        static_cast<impl*>(this)->suffix();
-    }
-};
 
 
 constexpr in_port_t DEFAULT_PORT = 8080;
 constexpr int MAX_MESSAGE_SIZE = 4096;
 constexpr int BACKLOG = 5;
-#if 1
+#define DO_SOCKETS 0
+#if DO_SOCKETS
 enum SOCKET_TYPE
 {
     CLIENT,
@@ -251,9 +90,9 @@ public:
         throw_if(valid, "Cannot connect, socket already valid");
 
         // create new file descriptor and then connect binds it to free port
-        allocated_fd = create_socket();
+        allocated_fd = create_socket_throw();
 
-        set_socket_options(allocated_fd);
+        set_socket_options_throw(allocated_fd);
 
         struct sockaddr_in server_address = address.to_sockaddr_in();
 
@@ -472,9 +311,9 @@ public:
     ServerSocket(in_port_t port)
     {
 
-        socket_fd = create_socket();
+        socket_fd = create_socket_throw();
 
-        set_socket_options(socket_fd);
+        set_socket_options_throw(socket_fd);
 
         // struct sockaddr_in server_address;
         // server_address.sin_family = AF_INET;
@@ -634,6 +473,14 @@ int main()
 
     in_port_t port = 8080;
     printcout(prints_new("Using Server Port: ", port));
+    TimeValue tv=TimeValue::now();
+    printcout(prints_new("Time: ", tv.to_time_string()));
+    printcout(prints_new("Date: ", tv.to_date_string()));
+    TimeValue tv2=TimeValue(1.5);
+    printcout(prints_new("Duration: ", tv2.to_duration_string()));
+    TimeValue tv3=TimeValue(-0.4);
+    printcout(prints_new("Duration: ", tv3.to_duration_string()));
+    #if DO_SOCKETS
     ServerSocket server_socket(port);
     int server_fd = server_socket.get_socket_fd();
 
@@ -668,6 +515,7 @@ int main()
 
     server_thread.join();
     client_thread.join();
+    #endif
 
     return 0;
 }
