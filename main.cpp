@@ -156,6 +156,19 @@ enum class error_code{
     TOO_LOW_THROUGHPUT=3,
     SOCKET_ERROR=4//+ errno set
 };
+std::string rate_to_string(double rate){//bytes per s
+    std::stringstream ss;
+    if(rate<1e3){
+        ss<<rate<<"B/s";
+    }else if(rate<1e6){
+        ss<<rate/1e3<<"KB/s";
+    }else if(rate<1e9){
+        ss<<rate/1e6<<"MB/s";
+    }else{
+        ss<<rate/1e9<<"GB/s";
+    }
+    return ss.str();
+}
 class TransmissionLayer{
     //=layer description:
     // i32 batch size
@@ -201,6 +214,14 @@ class TransmissionLayer{
     int recv_batch_len = -1;
     bool recv_batch_continue = false;
 
+
+    double get_throughput(){
+        if(batch_send_info_cumulative.first.is_near(0)){
+            return 0;
+        }
+        return batch_send_info_cumulative.second/batch_send_info_cumulative.first.to_double();
+    }
+
     //% returns true if we should timeout
     [[nodiscard]]
     bool update_throughput_queue(TimeValue time, i32 size){
@@ -215,8 +236,8 @@ class TransmissionLayer{
                 batch_send_info_cumulative.second-=front.second;
             }
             if(batch_send_info.size()>=last_batches){
-                double throughput = batch_send_info_cumulative.second;
-                if(throughput/batch_send_info_cumulative.first.to_double()<min_data_throughput_limit){
+                double throughput = get_throughput();
+                if(throughput<min_data_throughput_limit){
                     return true;
                 }
             }
@@ -576,7 +597,7 @@ class TransmissionLayer{
                 MUTEX_PRINT("Max batch receive time exceeded");
                 break;
             case error_code::TOO_LOW_THROUGHPUT:
-                throughput = batch_send_info_cumulative.second/batch_send_info_cumulative.first.to_double();
+                throughput = get_throughput();
                 MUTEX_PRINT("Too low throughput: "+std::to_string(throughput)+" bytes per second");
                 break;
             case error_code::SOCKET_ERROR:
@@ -808,7 +829,7 @@ int main()
                  {printcout(prints_new("break at i",i)); tl.print_errors();});
             }
             TL_ERR_and_return(tl.finalize_send(), tl.print_errors());
-
+            printcout(prints_new("final server throughput: ", rate_to_string(tl.get_throughput())));
             // NOTE: HoangLe [Nov-10]: Temporarily comment out this for testing purpose
             // open_socket.send_message("\nServer:Client Hello World\n");
         });
@@ -830,11 +851,18 @@ int main()
             printcout("receiving vector");
             TL_ERR_and_return(tl.initialize_recv(), tl.print_errors());
             i64 sum=0;
+            i32 expected=0;
             for(int i=0;i<vector_n;i++){
                 TL_ERR_and_return(tl.read_i32(v[i]), tl.print_errors());
                 sum+=v[i];
+                if(v[i]!=expected){
+                    printcout(prints_new("Mismatch at i: ", i, " expected: ", expected, " got: ", v[i]));
+                    break;
+                }
+                expected++;
             }
             printcout(prints_new("Sum: ", sum));
+            printcout(prints_new("final client throughput: ", rate_to_string(tl.get_throughput())));
 
 
             // NOTE: HoangLe [Nov-10]: Read binary file
