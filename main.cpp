@@ -12,7 +12,7 @@
 
 const TimeValue NO_DELAY{0.0};
 
-
+#define DEBUG_PRINTS 1
 
 
 static std::mutex io_mutex;
@@ -30,6 +30,13 @@ static std::mutex io_mutex;
         std::cout << x << std::endl;                \
     } while (0)
 
+#if DEBUG_PRINTS
+#define DEBUG_PRINT(x) MUTEX_PRINT(x)
+#define DEBUG_PRINT_INLINE(x) MUTEX_PRINT_INLINE(x)
+#else
+#define DEBUG_PRINT(x)
+#define DEBUG_PRINT_INLINE(x)
+#endif
 
 
 static_assert(sizeof(int) == sizeof(i32), "int and i32 must be the same size");
@@ -149,7 +156,7 @@ enum class error_code{
     TOO_LOW_THROUGHPUT=3,
     SOCKET_ERROR=4//+ errno set
 };
-class TransmitionLayer{
+class TransmissionLayer{
     //=layer description:
     // i32 batch size
     // bool batches continue
@@ -238,10 +245,10 @@ class TransmitionLayer{
         recv_batch_continue = false;
     }
 
-    TransmitionLayer(OpenSocket& sock_):
+    TransmissionLayer(OpenSocket& sock_):
         sock(sock_),
         continuity_buffer(CONTINUITY_LEN, 0){
-            throw_if(!sock.valid, "Socket not valid on TransmitionLayer creation");
+            throw_if(!sock.valid, "Socket not valid on TransmissionLayer creation");
         }
 
     inline char* out_buf_at(int offset){
@@ -254,16 +261,18 @@ class TransmitionLayer{
     //% true if error
     [[nodiscard]]
     bool send_if_dont_fit(const char* stream, int size){
+        int offset=0;
         while(size > remaining_out_buf()){//send loop
+            DEBUG_PRINT(prints_new("send:", size, ">", remaining_out_buf(),"written:", total_written));
             // std::memcpy(sock.out_buffer.data()+total_written, stream, remaining_out_buf());
             std::memcpy(out_buf_at(total_written), stream, remaining_out_buf());
             size-=remaining_out_buf();
-            stream+=remaining_out_buf();
+            offset+=remaining_out_buf();
             total_written+=remaining_out_buf();
             if (construct_and_send(1)) return true;
         }
         if(size>0){
-            std::memcpy(out_buf_at(total_written), stream, size);
+            std::memcpy(out_buf_at(total_written), stream+offset, size);
             total_written+=size;
         }
         return false;
@@ -289,11 +298,11 @@ class TransmitionLayer{
         if(send_n(total_written)){
             return true;
         }
-        total_sent = 0;
+        DEBUG_PRINT(prints_new("Sent batch: ", batches_sent, " with data length: ", data_len, " and continue: ", batches_continue));
+        total_sent = 0;//reset total sent
         total_written = TRANSMISSION_LAYER_HEADER;//the header is reserved
 
         batches_sent++;
-
         return false;
     }
     //! Note: Does not do any checks:
@@ -365,7 +374,7 @@ class TransmitionLayer{
         return send_if_dont_fit(str.data(), str.size());
     }
     [[nodiscard]]
-    bool finalize(){
+    bool finalize_send(){
         return construct_and_send(0);
     }
 
@@ -385,6 +394,23 @@ class TransmitionLayer{
                 return true;
             }
             total_read -= continuity;//places read pointer into the continuity segment copied from the previous batch
+        }
+        return false;
+    }
+    [[nodiscard]]
+    bool recv_next_if_need(){
+        //% check for total_received==MAX_MESSAGE_SIZE expected to have happened earlier
+        if(recv_batch_continue && total_read==total_received){
+            if(recv_new_batch(1)){
+                return true;
+            }
+        }
+        return false;
+    }
+    [[nodiscard]]
+    bool initialize_recv(){
+        if(recv_new_batch(0)){
+            return true;
         }
         return false;
     }
@@ -433,17 +459,27 @@ class TransmitionLayer{
         if(copy_continuity){
             std::memcpy(continuity_buffer.data(), in_buf_at(total_received-CONTINUITY_LEN), CONTINUITY_LEN);
         }
+
+        total_received = 0;//reset total_received
         if(recv_n(TRANSMISSION_LAYER_HEADER)){
             return true;
         }
         std::memcpy(&recv_batch_len, in_buf_at(0), sizeof(int));
         std::memcpy(&recv_batch_continue, in_buf_at(sizeof(int)), sizeof(bool));
+        
+        //% check for protocol errors
         throw_if(recv_batch_len>MAX_DATA_SIZE,
             prints_new("Data length mismatch on recv_new_batch:", recv_batch_len, " > ", MAX_DATA_SIZE));
+        throw_if(recv_batch_len!=MAX_DATA_SIZE && recv_batch_continue,
+            prints_new("Invalid batch len while batches continue:", recv_batch_len));
+
         if(recv_n(recv_batch_len)){
             return true;
         }
         total_read = TRANSMISSION_LAYER_HEADER;//since we just read the header
+
+        batches_received++;
+
         if(copy_continuity){
             std::memcpy(in_buf_at(TRANSMISSION_LAYER_INFO), continuity_buffer.data(), CONTINUITY_LEN);
             //% do not adjust total_read here based on continuity because 
@@ -453,6 +489,7 @@ class TransmitionLayer{
             last_error = error_code::TOO_LOW_THROUGHPUT;
             return true;
         }
+        DEBUG_PRINT(prints_new("Received batch: ", batches_received, " with data length: ", recv_batch_len, " and continue: ", recv_batch_continue));
         return false;
     }
     [[nodiscard]]
@@ -460,7 +497,7 @@ class TransmitionLayer{
         if(recv_if_not_enough(1)){
             return true;
         }
-        std::memcpy(&byte, in_buf_at(true_read_pos()), 1);
+        std::memcpy(&byte, in_buf_at(total_read), 1);
         total_read+=1;
         return false;
     }
@@ -469,12 +506,82 @@ class TransmitionLayer{
         if(recv_if_not_enough(sizeof(i32))){
             return true;
         }
-        std::memcpy(&val, in_buf_at(true_read_pos()), sizeof(i32));
+        std::memcpy(&val, in_buf_at(total_read), sizeof(i32));
         total_read+=sizeof(i32);
         return false;
     }
     [[nodiscard]]
-        
+    bool read_u64(u64& val){
+        if(recv_if_not_enough(sizeof(u64))){
+            return true;
+        }
+        std::memcpy(&val, in_buf_at(total_read), sizeof(u64));
+        total_read+=sizeof(u64);
+        return false;
+    }
+    [[nodiscard]]
+    bool read_i64(i64& val){
+        if(recv_if_not_enough(sizeof(i64))){
+            return true;
+        }
+        std::memcpy(&val, in_buf_at(total_read), sizeof(i64));
+        total_read+=sizeof(i64);
+        return false;
+    }
+    [[nodiscard]]
+    bool read_double(double& val){
+        if(recv_if_not_enough(sizeof(double))){
+            return true;
+        }
+        std::memcpy(&val, in_buf_at(total_read), sizeof(double));
+        total_read+=sizeof(double);
+        return false;
+    }
+    [[nodiscard]]
+    bool read_string(std::string& str){
+        i32 size;
+        if(read_i32(size)) return true;
+        if(recv_if_not_enough(size)){
+            return true;
+        }
+        str.resize(size);
+        //need to make a loop since string may be larger than remaining_in_buf
+        int read = 0;
+        while(read<size){
+            int to_read = min(size-read, remaining_in_buf());
+            std::memcpy(&str[read], in_buf_at(total_read), to_read);
+            total_read+=to_read;
+            read+=to_read;
+            if(recv_next_if_need()){
+                return true;
+            }
+        }
+        return false;
+    }
+    void print_errors(){
+        double throughput;
+        switch(last_error){
+            case error_code::NO_ERROR:
+                MUTEX_PRINT("No error");
+                break;
+            case error_code::MAX_BATCH_SEND_TIME:
+                MUTEX_PRINT("Max batch send time exceeded");
+                break;
+            case error_code::MAX_BATCH_RECEIVE_TIME:
+                MUTEX_PRINT("Max batch receive time exceeded");
+                break;
+            case error_code::TOO_LOW_THROUGHPUT:
+                throughput = batch_send_info_cumulative.second/batch_send_info_cumulative.first.to_double();
+                MUTEX_PRINT("Too low throughput: "+std::to_string(throughput)+" bytes per second");
+                break;
+            case error_code::SOCKET_ERROR:
+                MUTEX_PRINT("Socket error: errno="+std::to_string(static_cast<int>(errno)));
+                break;
+            default:
+                MUTEX_PRINT("Unknown error: errno="+std::to_string(static_cast<int>(errno)));
+                break;
+        }
+    }
 };
 
 
@@ -585,6 +692,14 @@ std::vector<ipv4_addr> getIPAddresses()
 
     return addresses;
 }
+#define TL_ERR_and_return(x, y) \
+    {                           \
+        if (x)                  \
+        {                       \
+            y;                  \
+            return;             \
+        }                       \
+    }
 
 int main()
 {
@@ -661,22 +776,60 @@ int main()
     int server_fd = server_socket.get_socket_fd();
 
     // Create thread for server and client service
+    int vector_n=10000;
     auto server_thread = std::thread(
-        [&server_socket, &server_fd]()
+        [&server_socket, &server_fd, vector_n]()
         {
             OpenSocket open_socket(SERVER);
             open_socket.accept_connection(server_fd);
-            open_socket.read_message();
+            // open_socket.read_message();
+            TransmissionLayer tl(open_socket);
+            TL_ERR_and_return(tl.write_string("(Server -> Client) Hello World"), tl.print_errors());
+            TL_ERR_and_return(tl.finalize_send(), tl.print_errors());
+            std::string str;
+            TL_ERR_and_return(tl.initialize_recv(), tl.print_errors());
+            TL_ERR_and_return(tl.read_string(str), tl.print_errors());
+            printcout(prints_new("Received: ", str));
+            std::vector<int> v(vector_n, 0);
+            i64 sum=0;
+            for(int i=0;i<vector_n;i++){
+                v[i]=i;
+                sum+=i;
+            }
+            printcout(prints_new("Sum: ", sum));
+            printcout("sending vector");
+            for(int i=0;i<vector_n;i++){
+                TL_ERR_and_return(tl.write_i32(v[i]), tl.print_errors());
+            }
+            TL_ERR_and_return(tl.finalize_send(), tl.print_errors());
 
             // NOTE: HoangLe [Nov-10]: Temporarily comment out this for testing purpose
             // open_socket.send_message("\nServer:Client Hello World\n");
         });
     auto client_thread = std::thread(
-        [&ip, &port]()
+        [&ip, &port, vector_n]()
         {
             OpenSocket open_socket(CLIENT);
             socket_address server_address(ip, port);
             open_socket.connect_to_server(server_address);
+
+            TransmissionLayer tl(open_socket);
+            std::string str;
+            TL_ERR_and_return(tl.initialize_recv(), tl.print_errors());
+            TL_ERR_and_return(tl.read_string(str), tl.print_errors());
+            printcout(prints_new("Received: ", str));
+            TL_ERR_and_return(tl.write_string("(Client -> Server) Hello World"), tl.print_errors());
+            TL_ERR_and_return(tl.finalize_send(), tl.print_errors());
+            std::vector<int> v(vector_n, 0);
+            printcout("receiving vector");
+            TL_ERR_and_return(tl.initialize_recv(), tl.print_errors());
+            i64 sum=0;
+            for(int i=0;i<vector_n;i++){
+                TL_ERR_and_return(tl.read_i32(v[i]), tl.print_errors());
+                sum+=v[i];
+            }
+            printcout(prints_new("Sum: ", sum));
+
 
             // NOTE: HoangLe [Nov-10]: Read binary file
             // std::string path = "amazon-beauty_test_non_metrics.xlsx";
@@ -685,8 +838,8 @@ int main()
             // std::string data(v_data.begin(), v_data.end());
             // open_socket.send_message(data);
 
-            open_socket.send_message("\nClient:Server Hello World\n");
-            open_socket.read_message();
+            // open_socket.send_message("\nClient:Server Hello World\n");
+            // open_socket.read_message();
         });
 
     server_thread.join();

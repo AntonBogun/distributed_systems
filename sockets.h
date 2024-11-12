@@ -134,7 +134,7 @@ std::string timeval_to_string(struct timeval tv){
 }
 //in seconds
 //both for duration and timepoints
-extern const TimeValue NO_DELAY;
+
 struct TimeValue{
     double time;
     TimeValue(double t): time(t){}
@@ -193,16 +193,16 @@ struct TimeValue{
     TimeValue operator/(double other){
         return TimeValue(time/other);
     }
-    bool operator<(TimeValue other){
+    bool operator<(const TimeValue other) const {
         return time<other.time;
     }
-    bool operator>(TimeValue other){
+    bool operator>(const TimeValue other) const {
         return time>other.time;
     }
-    bool operator<=(TimeValue other){
+    bool operator<=(const TimeValue other) const {
         return time<=other.time;
     }
-    bool operator>=(TimeValue other){
+    bool operator>=(const TimeValue other) const {
         return time>=other.time;
     }
     // do not compare floating point numbers for equality
@@ -213,7 +213,7 @@ struct TimeValue{
         return std::abs(time-other.time)<epsilon;
     }   
 };
-
+extern const TimeValue NO_DELAY;
 
 int create_socket_throw()
 {
