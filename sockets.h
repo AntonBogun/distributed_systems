@@ -9,6 +9,12 @@
 #include <ctime>
 #include <iomanip>
 
+#define throw_if(condition, message)       \
+    if (condition)                         \
+    {                                      \
+        throw std::runtime_error(message); \
+    }
+
 struct ipv4_addr
 {
     u8 a;
@@ -121,61 +127,84 @@ auto timeinsec(std::chrono::high_resolution_clock::duration t){
 auto timeinmsec(std::chrono::high_resolution_clock::duration t){
   return std::chrono::duration<double, std::milli>(t);
 }
+std::string timeval_to_string(struct timeval tv){
+    std::stringstream ss;
+    ss<<tv.tv_sec<<"."<<std::setfill('0')<<std::setw(6)<<tv.tv_usec;
+    return ss.str();
+}
 //in seconds
 //both for duration and timepoints
 struct TimeValue{
-    // double time;
-    i64 seconds;
-    i32 useconds;
-    bool negative=false;
-
-    explicit TimeValue(i64 s, i64 us): seconds(s), useconds(us){}
-    explicit TimeValue(double t): 
-        seconds(static_cast<i64>(t)),
-        useconds(static_cast<i64>((t-seconds)*1e6)){}
+    double time;
+    explicit TimeValue(double t): time(t){}
     explicit TimeValue(struct timeval tv): 
-        seconds(tv.tv_sec),
-        useconds(tv.tv_usec){}
+    time(static_cast<double>(tv.tv_sec)+static_cast<double>(tv.tv_usec)/1e6){}
     static TimeValue now() {
         struct timeval tv;
         gettimeofday(&tv, nullptr);
-        return TimeValue{static_cast<i64>(tv.tv_sec), static_cast<i64>(tv.tv_usec)};
+        return TimeValue{tv};
+    }
+    double to_double(){
+        return time;
+    }
+    //** undefined when negative
+    struct timeval to_timeval(){
+        throw_if(time<0, "TimeValue to_timeval: negative time");
+        struct timeval tv;
+        tv.tv_sec=static_cast<time_t>(time);
+        tv.tv_usec=static_cast<suseconds_t>((time-static_cast<double>(tv.tv_sec))*1e6);
+        return tv;
     }
     std::string to_duration_string(){
         std::stringstream ss;
-        ss<<seconds<<"s "<<useconds<<"us";
+        //at most 6 decimal places
+        ss<<std::setprecision(6)<<time<<"s";
         return ss.str();
     }
-    std::string to_time_string(){
-        std::stringstream ss;
-        ss<<seconds<<"."<<useconds;
-        return ss.str();
-    }
-    //undefined when negative
+    //** undefined when negative
     std::string to_date_string(){
         struct tm* tm_info;
         char buffer[30];
-        tm_info = localtime(&seconds);
+        struct timeval tv = to_timeval();
+        tm_info = localtime(&tv.tv_sec);
         strftime(buffer, 30, "%Y-%m-%d %H:%M:%S", tm_info);
         std::stringstream ss;
-        ss<<buffer<<"."<<std::setfill('0')<<std::setw(6)<<useconds;
+        ss<<buffer<<"."<<std::setfill('0')<<std::setw(6)<<tv.tv_usec;
         return ss.str();
     }
-    
-
-    
+    TimeValue operator+(TimeValue other){
+        return TimeValue(time+other.time);
+    }
+    TimeValue operator-(TimeValue other){
+        return TimeValue(time-other.time);
+    }
+    TimeValue operator*(double other){
+        return TimeValue(time*other);
+    }
+    TimeValue operator/(double other){
+        return TimeValue(time/other);
+    }
+    bool operator<(TimeValue other){
+        return time<other.time;
+    }
+    bool operator>(TimeValue other){
+        return time>other.time;
+    }
+    bool operator<=(TimeValue other){
+        return time<=other.time;
+    }
+    bool operator>=(TimeValue other){
+        return time>=other.time;
+    }
+    // do not compare floating point numbers for equality
+    // bool operator==(TimeValue other){
+    //     return time==other.time;
+    // }
+    bool is_near(TimeValue other, double epsilon=1e-6){
+        return std::abs(time-other.time)<epsilon;
+    }   
 };
 
-// void throw_if(bool condition, const std::string &message){
-//     if (condition) {
-//         throw std::runtime_error(message);
-//     }
-// }
-#define throw_if(condition, message)       \
-    if (condition)                         \
-    {                                      \
-        throw std::runtime_error(message); \
-    }
 
 int create_socket_throw()
 {

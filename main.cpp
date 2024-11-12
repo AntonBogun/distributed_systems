@@ -474,7 +474,7 @@ int main()
     in_port_t port = 8080;
     printcout(prints_new("Using Server Port: ", port));
     TimeValue tv=TimeValue::now();
-    printcout(prints_new("Time: ", tv.to_time_string()));
+    printcout(prints_new("Time: ", tv.to_duration_string()));
     printcout(prints_new("Date: ", tv.to_date_string()));
     TimeValue tv2=TimeValue(1.5);
     printcout(prints_new("Duration: ", tv2.to_duration_string()));
