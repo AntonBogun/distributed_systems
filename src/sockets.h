@@ -1,13 +1,14 @@
 #include "utils.h"
+
+#include <arpa/inet.h>
+#include <ctime>
+#include <ifaddrs.h>
+#include <iomanip>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <ifaddrs.h>
-#include <sys/time.h>
-#include <ctime>
-#include <iomanip>
 
 #define throw_if(condition, message)       \
     if (condition)                         \
@@ -118,100 +119,120 @@ std::string socket_address_to_string(struct sockaddr_in addr)
     return ss.str();
 }
 
-auto timenow(){
-  return std::chrono::high_resolution_clock::now();
+auto timenow()
+{
+    return std::chrono::high_resolution_clock::now();
 }
-auto timeinsec(std::chrono::high_resolution_clock::duration t){
-  return std::chrono::duration<double>(t);
+auto timeinsec(std::chrono::high_resolution_clock::duration t)
+{
+    return std::chrono::duration<double>(t);
 }
-auto timeinmsec(std::chrono::high_resolution_clock::duration t){
-  return std::chrono::duration<double, std::milli>(t);
+auto timeinmsec(std::chrono::high_resolution_clock::duration t)
+{
+    return std::chrono::duration<double, std::milli>(t);
 }
-std::string timeval_to_string(struct timeval tv){
+std::string timeval_to_string(struct timeval tv)
+{
     std::stringstream ss;
-    ss<<tv.tv_sec<<"."<<std::setfill('0')<<std::setw(6)<<tv.tv_usec;
+    ss << tv.tv_sec << "." << std::setfill('0') << std::setw(6) << tv.tv_usec;
     return ss.str();
 }
-//in seconds
-//both for duration and timepoints
+// in seconds
+// both for duration and timepoints
 
-struct TimeValue{
+struct TimeValue
+{
     double time;
-    TimeValue(double t): time(t){}
-    explicit TimeValue(struct timeval tv): 
-    time(static_cast<double>(tv.tv_sec)+static_cast<double>(tv.tv_usec)/1e6){}
-    static TimeValue now() {
+    TimeValue(double t) : time(t) {}
+    explicit TimeValue(struct timeval tv) : time(static_cast<double>(tv.tv_sec) + static_cast<double>(tv.tv_usec) / 1e6) {}
+    static TimeValue now()
+    {
         struct timeval tv;
         gettimeofday(&tv, nullptr);
         return TimeValue{tv};
     }
-    double to_double(){
+    double to_double()
+    {
         return time;
     }
     //** undefined when negative
-    struct timeval to_timeval(){
-        throw_if(time<0, "TimeValue to_timeval: negative time");
+    struct timeval to_timeval()
+    {
+        throw_if(time < 0, "TimeValue to_timeval: negative time");
         struct timeval tv;
-        tv.tv_sec=static_cast<time_t>(time);
-        tv.tv_usec=static_cast<suseconds_t>((time-static_cast<double>(tv.tv_sec))*1e6);
+        tv.tv_sec = static_cast<time_t>(time);
+        tv.tv_usec = static_cast<suseconds_t>((time - static_cast<double>(tv.tv_sec)) * 1e6);
         return tv;
     }
-    std::string to_duration_string(){
+    std::string to_duration_string()
+    {
         std::stringstream ss;
-        //at most 6 decimal places
-        ss<<std::setprecision(6)<<time<<"s";
+        // at most 6 decimal places
+        ss << std::setprecision(6) << time << "s";
         return ss.str();
     }
     //** undefined when negative
-    std::string to_date_string(){
-        struct tm* tm_info;
+    std::string to_date_string()
+    {
+        struct tm *tm_info;
         char buffer[30];
         struct timeval tv = to_timeval();
         tm_info = localtime(&tv.tv_sec);
         strftime(buffer, 30, "%Y-%m-%d %H:%M:%S", tm_info);
         std::stringstream ss;
-        ss<<buffer<<"."<<std::setfill('0')<<std::setw(6)<<tv.tv_usec;
+        ss << buffer << "." << std::setfill('0') << std::setw(6) << tv.tv_usec;
         return ss.str();
     }
-    TimeValue operator+(TimeValue other){
-        return TimeValue(time+other.time);
+    TimeValue operator+(TimeValue other)
+    {
+        return TimeValue(time + other.time);
     }
-    TimeValue operator+=(TimeValue other){
-        time+=other.time;
+    TimeValue operator+=(TimeValue other)
+    {
+        time += other.time;
         return *this;
     }
-    TimeValue operator-(TimeValue other){
-        return TimeValue(time-other.time);
+    TimeValue operator-(TimeValue other)
+    {
+        return TimeValue(time - other.time);
     }
-    TimeValue operator-=(TimeValue other){
-        time-=other.time;
+    TimeValue operator-=(TimeValue other)
+    {
+        time -= other.time;
         return *this;
     }
-    TimeValue operator*(double other){
-        return TimeValue(time*other);
+    TimeValue operator*(double other)
+    {
+        return TimeValue(time * other);
     }
-    TimeValue operator/(double other){
-        return TimeValue(time/other);
+    TimeValue operator/(double other)
+    {
+        return TimeValue(time / other);
     }
-    bool operator<(const TimeValue other) const {
-        return time<other.time;
+    bool operator<(const TimeValue other) const
+    {
+        return time < other.time;
     }
-    bool operator>(const TimeValue other) const {
-        return time>other.time;
+    bool operator>(const TimeValue other) const
+    {
+        return time > other.time;
     }
-    bool operator<=(const TimeValue other) const {
-        return time<=other.time;
+    bool operator<=(const TimeValue other) const
+    {
+        return time <= other.time;
     }
-    bool operator>=(const TimeValue other) const {
-        return time>=other.time;
+    bool operator>=(const TimeValue other) const
+    {
+        return time >= other.time;
     }
     // do not compare floating point numbers for equality
     // bool operator==(TimeValue other){
     //     return time==other.time;
     // }
-    bool is_near(TimeValue other, double epsilon=1e-6){
-        return std::abs(time-other.time)<epsilon;
-    }   
+    bool is_near(TimeValue other, double epsilon = 1e-6)
+    {
+        return std::abs(time - other.time) < epsilon;
+    }
 };
 extern const TimeValue NO_DELAY;
 
@@ -234,12 +255,14 @@ void set_socket_options_throw(int socket_fd)
 
 //% true means error + errno set
 [[nodiscard]]
-bool set_socket_send_timeout(int socket_fd, TimeValue timeout){
+bool set_socket_send_timeout(int socket_fd, TimeValue timeout)
+{
     struct timeval tv = timeout.to_timeval();
     return setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0;
 }
 [[nodiscard]]
-bool set_socket_recv_timeout(int socket_fd, TimeValue timeout){
+bool set_socket_recv_timeout(int socket_fd, TimeValue timeout)
+{
     struct timeval tv = timeout.to_timeval();
     return setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0;
 }
