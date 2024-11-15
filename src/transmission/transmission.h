@@ -20,9 +20,24 @@ enum SOCKET_TYPE
     SERVER
 };
 
+enum class error_code
+{
+    NO_ERROR = 0,
+    MAX_BATCH_SEND_TIME = 1,
+    MAX_BATCH_RECEIVE_TIME = 2,
+    TOO_LOW_THROUGHPUT = 3,
+    SOCKET_ERROR = 4 //+ errno set
+};
+
+
 constexpr in_port_t DEFAULT_PORT = 8080;
 constexpr int MAX_MESSAGE_SIZE = 4096;
 constexpr int BACKLOG = 5;
+
+constexpr int TRANSMISSION_LAYER_INFO = sizeof(int) + sizeof(bool); // datalen + batches_continue
+constexpr int CONTINUITY_LEN = sizeof(u64);                         // continuity between batches
+constexpr int TRANSMISSION_LAYER_HEADER = TRANSMISSION_LAYER_INFO + CONTINUITY_LEN;
+constexpr int MAX_DATA_SIZE = MAX_MESSAGE_SIZE - TRANSMISSION_LAYER_HEADER;
 
 const TimeValue NO_DELAY{0.0};
 

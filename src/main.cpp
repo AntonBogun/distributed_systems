@@ -15,18 +15,7 @@
 #define DO_SOCKETS 1
 #if DO_SOCKETS
 
-constexpr int TRANSMISSION_LAYER_INFO = sizeof(int) + sizeof(bool); // datalen + batches_continue
-constexpr int CONTINUITY_LEN = sizeof(u64);                         // continuity between batches
-constexpr int TRANSMISSION_LAYER_HEADER = TRANSMISSION_LAYER_INFO + CONTINUITY_LEN;
-constexpr int MAX_DATA_SIZE = MAX_MESSAGE_SIZE - TRANSMISSION_LAYER_HEADER;
-enum class error_code
-{
-    NO_ERROR = 0,
-    MAX_BATCH_SEND_TIME = 1,
-    MAX_BATCH_RECEIVE_TIME = 2,
-    TOO_LOW_THROUGHPUT = 3,
-    SOCKET_ERROR = 4 //+ errno set
-};
+
 std::string rate_to_string(double rate)
 { // bytes per s
     std::stringstream ss;
