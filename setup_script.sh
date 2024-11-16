@@ -1,9 +1,9 @@
 #!/bin/bash
 # Ensure called from distributed_systems folder
-REPO_NAME="distributed_systems"
 
-
+REPO_NAME="remote_exec"
 REPO_URL="https://github.com/AntonBogun/distributed_systems.git"
+
 REPO_DIR="$HOME/$REPO_NAME"
 # Navigate to the repository directory
 mkdir -p "$REPO_DIR" || {
@@ -17,8 +17,8 @@ cd "$REPO_DIR" || {
 
 # Ensure repository is cloned
 if [ ! -d ".git" ]; then
-    echo "Cloning repository from $REPO_URL..."
-    git clone "$REPO_URL" || {
+    echo "Cloning repository from $REPO_URL into $REPO_DIR..."
+    git clone "$REPO_URL" "$REPO_DIR" || {
         echo "Error: failed to clone repository."
         exit 1
     }
@@ -46,3 +46,11 @@ git reset --hard origin/master || {
 }
 
 echo "Repository is now at the latest upstream master."
+echo ""
+echo "Running make"
+make || {
+    echo "Error: failed to run make."
+    exit 1
+}
+echo ""
+echo "Setup complete."
