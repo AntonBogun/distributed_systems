@@ -1,6 +1,4 @@
-#ifndef MODE_HPP
-#define MODE_HPP
-
+#pragma once
 class DataNode
 {
 private:
@@ -31,8 +29,6 @@ public:
     DNS(/* args */);
     ~DNS();
 };
-
-#endif
 
 // ================================================================
 

@@ -1,6 +1,4 @@
-#ifndef PACKETS_HPP
-#define PACKETS_HPP
-
+#pragma once
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -49,5 +47,3 @@ public:
 
     ~Packet();
 };
-
-#endif
