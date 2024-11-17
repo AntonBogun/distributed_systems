@@ -1,3 +1,4 @@
+#pragma once
 #include "sockets.h"
 #include "utils.h"
 
@@ -13,6 +14,8 @@
 #include <chrono>
 
 
+namespace distribsys{
+
 
 enum SOCKET_TYPE
 {
@@ -20,9 +23,22 @@ enum SOCKET_TYPE
     SERVER
 };
 
+enum class error_code
+{
+    NO_ERROR = 0,
+    MAX_BATCH_SEND_TIME = 1,
+    MAX_BATCH_RECEIVE_TIME = 2,
+    TOO_LOW_THROUGHPUT = 3,
+    SOCKET_ERROR = 4 //+ errno set
+};
+
+
 constexpr in_port_t DEFAULT_PORT = 8080;
+constexpr in_port_t DNS_PORT = 8989;
 constexpr int MAX_MESSAGE_SIZE = 4096;
-constexpr int BACKLOG = 5;
+
+constexpr int TRANSMISSION_LAYER_HEADER = sizeof(int) + sizeof(bool); // datalen + batches_continue
+constexpr int MAX_DATA_SIZE = MAX_MESSAGE_SIZE - TRANSMISSION_LAYER_HEADER;
 
 const TimeValue NO_DELAY{0.0};
 
@@ -82,15 +98,32 @@ public:
                                          sock_type(sock_type_)
     {
     }
-
-    void accept_connection(in_port_t server_fd)
+    //% return true if timeout
+    [[nodiscard]]
+    bool accept_connection(in_port_t server_fd, TimeValue timeout = NO_DELAY)
     { // server file descriptor
         throw_if(sock_type != SERVER, "Cannot accept connection on client socket");
         throw_if(valid, "Cannot accept, socket already valid");
 
+        set_timeout_throw(server_fd, timeout);
+
         struct sockaddr_in client_address;    // overwritten by accept
         int addrlen = sizeof(client_address); // overwritten by accept
-        allocated_fd = accept(server_fd, (struct sockaddr *)&client_address, (socklen_t *)&addrlen);
+        TimeValue start = TimeValue::now();
+        while(true){//wait for connection
+            allocated_fd = accept(server_fd, (struct sockaddr *)&client_address, (socklen_t *)&addrlen);
+            if(allocated_fd<0){
+                if(errno==EINTR||errno==EAGAIN||errno==EWOULDBLOCK){
+                    if(!timeout.is_near(0) && TimeValue::now()-start>timeout){
+                        return true;
+                    }else{
+                        continue;
+                    }
+                }else{
+                    break;
+                }
+            }
+        }
         throw_if(allocated_fd < 0,
                  prints_new("Failed to accept connection, errno:", errno));
 
@@ -104,8 +137,10 @@ public:
         MUTEX_PRINT(prints_new("Accepted connection from client: ", socket_address_to_string(other_address),
                                " to server: ", socket_address_to_string(socket_address::from_fd_local(allocated_fd))));
         valid = true;
+        return false;
     }
-    void connect_to_server(socket_address address)
+    [[nodiscard]]
+    bool connect_to_server(socket_address address, TimeValue timeout = NO_DELAY)
     {
         throw_if(sock_type != CLIENT, "Cannot connect to server on server socket");
         throw_if(valid, "Cannot connect, socket already valid");
@@ -114,11 +149,27 @@ public:
         allocated_fd = create_socket_throw();
 
         set_socket_options_throw(allocated_fd);
+        set_timeout_throw(allocated_fd, timeout);
 
         struct sockaddr_in server_address = address.to_sockaddr_in();
 
-        throw_if(connect(allocated_fd, (struct sockaddr *)&server_address, sizeof(server_address)) < 0,
-                 prints_new("Failed to connect to server, errno:", errno));
+        int res;
+        TimeValue start = TimeValue::now();
+        while(true){//wait for connection
+            res = connect(allocated_fd, (struct sockaddr *)&server_address, sizeof(server_address));
+            if(res<0){
+                if(errno==EINTR||errno==EAGAIN||errno==EWOULDBLOCK){
+                    if(!timeout.is_near(0) && TimeValue::now()-start>timeout){
+                        return true;
+                    }else{
+                        continue;
+                    }
+                }else{
+                    break;
+                }
+            }
+        }
+        throw_if(res < 0, prints_new("Failed to connect to server, errno:", errno));
 
         other_address = address;
 
@@ -130,6 +181,7 @@ public:
         MUTEX_PRINT(prints_new("Connected to server: ", socket_address_to_string(other_address),
                                " from client: ", socket_address_to_string(socket_address::from_fd_local(allocated_fd))));
         valid = true;
+        return false;
     }
     [[nodiscard]]
     ssize_t Send(int fd, const void *buf, size_t len, int flags)
@@ -162,7 +214,6 @@ class TransmissionLayer{
     // bool batches continue
     public:
     OpenSocket& sock;
-    FCVector<u8> continuity_buffer;
     //actual buf size, represent total amount of data written so far 
     //% note: starts at TRANSMISSION_LAYER_HEADER since that is always reserved
     int total_written = TRANSMISSION_LAYER_HEADER;
@@ -171,17 +222,15 @@ class TransmissionLayer{
     //actual sent size, used during transmission
     //represents total amount of data sent so far
     int total_sent = 0;
-    //actual read size, starts at TRANSMISSION_LAYER_HEADER 
-    //% NOTE: this can be less than TRANSMISSION_LAYER_HEADER (by at most CONTINUITY_LEN (-1?))
-    //% when performing continuity merge
+    //actual read size, starts at TRANSMISSION_LAYER_HEADER
     int total_read = TRANSMISSION_LAYER_HEADER;
     //MAX_MESSAGE_SIZE - total_written
     inline int remaining_out_buf_to_write() const { return MAX_MESSAGE_SIZE - total_written; }
-    //MAX_MESSAGE_SIZE - total_read
-    //% NOTICE: this uses total_written instead of total_written as with out_buf_to_write
+    //total_received - total_read
+    //% NOTICE: different from remaining_out_buf_to_write
     //% this is because read.. cares about remaining *received* space in the buffer
     //% while write.. cares about remaining *free* space in the buffer
-    inline int remaining_in_buf_to_read() const { return MAX_MESSAGE_SIZE - total_read; }
+    inline int remaining_in_buf_to_read() const { return total_received - total_read; }
 
     i64 batches_sent = 0;
     i64 batches_received = 0;
@@ -257,8 +306,7 @@ class TransmissionLayer{
     }
 
     TransmissionLayer(OpenSocket& sock_):
-        sock(sock_),
-        continuity_buffer(CONTINUITY_LEN, 0){
+        sock(sock_){
             throw_if(!sock.valid, "Socket not valid on TransmissionLayer creation");
         }
 
@@ -300,11 +348,6 @@ class TransmissionLayer{
 
         std::memcpy(out_buf_at(0), &data_len, sizeof(int));//set data length
         std::memset(out_buf_at(sizeof(int)), batches_continue, sizeof(bool));//set batches continue
-
-        //~ neither of these are required since the continuity segment is never used in sending,
-        //~ it may be anything on send
-        // std::memcpy(out_buf_at(TRANSMISSION_LAYER_INFO), continuity_buffer.data(), CONTINUITY_LEN);
-        // std::memset(out_buf_at(TRANSMISSION_LAYER_INFO), 0, CONTINUITY_LEN);
 
         if(send_n(total_written)){
             return true;
@@ -384,6 +427,18 @@ class TransmissionLayer{
         if(write_i32(str.size())) return true;
         return send_if_dont_fit(str.data(), str.size());
     }
+    //% does not add size of array to the message
+    //% warning: handles at most INT_MAX bytes
+    [[nodiscard]]
+    bool write_bytes(const char* arr, int size){
+        return send_if_dont_fit(arr, size);
+    }
+    template<typename T>
+    [[nodiscard]]
+    bool write_type(const T& val){
+        static_assert(std::is_trivially_copyable<T>::value, "Type must be trivially copyable");
+        return write_bytes(reinterpret_cast<const char*>(&val), sizeof(T));
+    }
     [[nodiscard]]
     bool finalize_send(){
         return construct_and_send(0);
@@ -391,38 +446,32 @@ class TransmissionLayer{
 
     
     //% true if error
-    //~ note that this is undefined if size is above CONTINUITY_LEN
     [[nodiscard]]
-    bool recv_if_not_enough(int size){
-        //trying to read more than the protocol allows
-        throw_if(!recv_batch_continue && total_read+size>total_received, 
-            prints_new("Size mismatch on recv_if_not_enough: size=",size,",", total_read+size, " > ", total_received));
-        if(size > remaining_in_buf_to_read()){//have to read more
-            //protocol error
-            throw_if(!recv_batch_continue, "Unexpected batches continue == 0 on recv_if_not_enough");
-            auto continuity = remaining_in_buf_to_read(); 
-            DEBUG_PRINT(prints_new("Continuity read: ", continuity));
-            if(recv_new_batch(1)){
-                return true;
-            }
-            //places read pointer backward into the continuity segment copied from the previous batch
-            total_read -= continuity;
+    bool recv_if_not_enough(char* stream,int size){
+        while(size>remaining_in_buf_to_read()){
+            //trying to read more than the partially full last batch
+            throw_if(total_read+size>total_received && total_received<MAX_MESSAGE_SIZE, 
+            prints_new("Attemt to read beyond total message size: size=",size,",", total_read+size, " > ", total_received));
+            //trying to read more than the full last batch
+            throw_if(!recv_batch_continue && total_read+size>total_received, 
+            prints_new("Attemt to request a new batch on the last batch: size=",size,",", total_read+size, " > ", total_received));
+
+            int remaining = remaining_in_buf_to_read();
+            std::memcpy(stream, in_buf_at(total_read), remaining);
+            size-=remaining;//subtract read
+            stream+=remaining;//move pointer forward
+            total_read+=remaining;//finish up the buffer
+            if(recv_new_batch()) return true;
         }
-        return false;
-    }
-    [[nodiscard]]
-    bool recv_next_if_need(){
-        //% check for total_received==MAX_MESSAGE_SIZE expected to have happened earlier
-        if(recv_batch_continue && total_read==total_received){
-            if(recv_new_batch(1)){
-                return true;
-            }
+        if(size>0){
+            std::memcpy(stream, in_buf_at(total_read), size);
+            total_read+=size;
         }
         return false;
     }
     [[nodiscard]]
     bool initialize_recv(){
-        if(recv_new_batch(0)){
+        if(recv_new_batch()){
             return true;
         }
         return false;
@@ -464,15 +513,9 @@ class TransmissionLayer{
     }
     //% true if error
     [[nodiscard]]
-    bool recv_new_batch(bool copy_continuity){
-        //copy the last batch's continuity segment to continuity_buffer
-        //%note: doesn't check for the total_received to be MAX_MESSAGE_SIZE for simplicity
+    bool recv_new_batch(){
         throw_if(!sock.valid, "Socket not valid on recv_new_batch");
         TimeValue start=TimeValue::now();
-        if(copy_continuity){
-            std::memcpy(continuity_buffer.data(), in_buf_at(total_received-CONTINUITY_LEN), CONTINUITY_LEN);
-        }
-
         total_received = 0;//reset total_received
         if(recv_n(TRANSMISSION_LAYER_HEADER)){
             return true;
@@ -489,15 +532,10 @@ class TransmissionLayer{
         if(recv_n(recv_batch_len)){
             return true;
         }
-        total_read = TRANSMISSION_LAYER_HEADER;//since we just read the header
+        total_read = TRANSMISSION_LAYER_HEADER;//since we've just read the header
 
         batches_received++;
 
-        if(copy_continuity){
-            std::memcpy(in_buf_at(TRANSMISSION_LAYER_INFO), continuity_buffer.data(), CONTINUITY_LEN);
-            //% do not adjust total_read here based on continuity because 
-            //% it doesn't get passed into the function
-        }
         if(update_throughput_queue(TimeValue::now()-start, total_received)){
             last_error = error_code::TOO_LOW_THROUGHPUT;
             return true;
@@ -507,69 +545,40 @@ class TransmissionLayer{
     }
     [[nodiscard]]
     bool read_byte(u8& byte){
-        if(recv_if_not_enough(1)){
-            return true;
-        }
-        std::memcpy(&byte, in_buf_at(total_read), 1);
-        total_read+=1;
-        return false;
+        return recv_if_not_enough((char*)&byte, 1);
     }
     [[nodiscard]]
     bool read_i32(i32& val){
-        if(recv_if_not_enough(sizeof(i32))){
-            return true;
-        }
-        std::memcpy(&val, in_buf_at(total_read), sizeof(i32));
-        total_read+=sizeof(i32);
-        return false;
+        return recv_if_not_enough((char*)&val, sizeof(i32));
     }
     [[nodiscard]]
     bool read_u64(u64& val){
-        if(recv_if_not_enough(sizeof(u64))){
-            return true;
-        }
-        std::memcpy(&val, in_buf_at(total_read), sizeof(u64));
-        total_read+=sizeof(u64);
-        return false;
+        return recv_if_not_enough((char*)&val, sizeof(u64));
     }
     [[nodiscard]]
     bool read_i64(i64& val){
-        if(recv_if_not_enough(sizeof(i64))){
-            return true;
-        }
-        std::memcpy(&val, in_buf_at(total_read), sizeof(i64));
-        total_read+=sizeof(i64);
-        return false;
+        return recv_if_not_enough((char*)&val, sizeof(i64));
     }
     [[nodiscard]]
     bool read_double(double& val){
-        if(recv_if_not_enough(sizeof(double))){
-            return true;
-        }
-        std::memcpy(&val, in_buf_at(total_read), sizeof(double));
-        total_read+=sizeof(double);
-        return false;
+        return recv_if_not_enough((char*)&val, sizeof(double));
     }
     [[nodiscard]]
     bool read_string(std::string& str){
         i32 size;
         if(read_i32(size)) return true;
-        if(recv_if_not_enough(size)){
-            return true;
-        }
         str.resize(size);
-        //need to make a loop since string may be larger than remaining_in_buf
-        int read = 0;
-        while(read<size){
-            int to_read = min(size-read, remaining_in_buf_to_read());
-            std::memcpy(&str[read], in_buf_at(total_read), to_read);
-            total_read+=to_read;
-            read+=to_read;
-            if(recv_next_if_need()){
-                return true;
-            }
-        }
-        return false;
+        return recv_if_not_enough(str.data(), size);
+    }
+    [[nodiscard]]
+    bool read_bytes(char* arr, int size){
+        return recv_if_not_enough(arr, size);
+    }
+    template<typename T>
+    [[nodiscard]]
+    bool read_type(T& val){
+        static_assert(std::is_trivially_copyable<T>::value, "Type must be trivially copyable");
+        return read_bytes(reinterpret_cast<char*>(&val), sizeof(T));
     }
     void print_errors(){
         double throughput;
@@ -597,3 +606,5 @@ class TransmissionLayer{
     }
 };
 
+
+}//namespace distribsys

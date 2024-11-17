@@ -1,6 +1,7 @@
 #include "sockets.h"
-#include "transmission/transmission.h"
+#include "transmission.h"
 #include "utils.h"
+#include "nodes.h"
 
 #include <algorithm>
 #include <chrono>
@@ -11,22 +12,11 @@
 #include <queue>
 #include <thread>
 #include <vector>
+#include <endian.h>
+static_assert(BYTE_ORDER == LITTLE_ENDIAN, "This code only works on little-endian systems");
 
-#define DO_SOCKETS 1
-#if DO_SOCKETS
+using namespace distribsys;
 
-constexpr int TRANSMISSION_LAYER_INFO = sizeof(int) + sizeof(bool); // datalen + batches_continue
-constexpr int CONTINUITY_LEN = sizeof(u64);                         // continuity between batches
-constexpr int TRANSMISSION_LAYER_HEADER = TRANSMISSION_LAYER_INFO + CONTINUITY_LEN;
-constexpr int MAX_DATA_SIZE = MAX_MESSAGE_SIZE - TRANSMISSION_LAYER_HEADER;
-enum class error_code
-{
-    NO_ERROR = 0,
-    MAX_BATCH_SEND_TIME = 1,
-    MAX_BATCH_RECEIVE_TIME = 2,
-    TOO_LOW_THROUGHPUT = 3,
-    SOCKET_ERROR = 4 //+ errno set
-};
 std::string rate_to_string(double rate)
 { // bytes per s
     std::stringstream ss;
@@ -48,55 +38,6 @@ std::string rate_to_string(double rate)
     }
     return ss.str();
 }
-
-class ServerSocket
-{
-    int socket_fd;
-
-public:
-    bool connection_open = false;
-    ServerSocket(in_port_t port)
-    {
-
-        socket_fd = create_socket_throw();
-
-        set_socket_options_throw(socket_fd);
-
-        // struct sockaddr_in server_address;
-        // server_address.sin_family = AF_INET;
-        // server_address.sin_addr.s_addr = htonl(INADDR_ANY);
-        // server_address.sin_port = htons(PORT);
-        struct sockaddr_in bind_address = socket_address(0, 0, 0, 0, port).to_sockaddr_in(); // 0,0,0,0 to bind to all interfaces
-        throw_if(bind(socket_fd, (struct sockaddr *)&bind_address, sizeof(bind_address)) < 0,
-                 prints_new("Failed to bind socket, errno:", errno));
-
-        socket_address bound_address = socket_address::from_fd_local(socket_fd);
-
-        throw_if(bound_address.port != port,
-                 prints_new("Bind port mismatch: bound ", bound_address.port, " != target ", port));
-
-        printcout(prints_new("Server socket bound to: ", socket_address_to_string(bound_address)));
-
-        throw_if(listen(socket_fd, BACKLOG) < 0,
-                 prints_new("Failed to listen, errno:", errno));
-
-        printcout("Listening for connections...");
-    }
-
-    int get_socket_fd()
-    {
-        return socket_fd;
-    }
-    void close_socket()
-    {
-        close(socket_fd);
-    }
-    ~ServerSocket()
-    {
-        close_socket();
-    }
-};
-#endif
 
 std::vector<ipv4_addr> getIPAddresses()
 {
@@ -235,7 +176,6 @@ int main()
     printcout(prints_new("Duration: ", tv2.to_duration_string()));
     TimeValue tv3 = TimeValue(-0.4);
     printcout(prints_new("Duration: ", tv3.to_duration_string()));
-#if DO_SOCKETS
     ServerSocket server_socket(port);
     int server_fd = server_socket.get_socket_fd();
 
@@ -245,7 +185,7 @@ int main()
         [&server_socket, &server_fd, vector_n]()
         {
             OpenSocket open_socket(SERVER);
-            open_socket.accept_connection(server_fd);
+            TL_ERR_and_return(open_socket.accept_connection(server_fd), printcout("timeout on accept"));
             // open_socket.read_message();
             TransmissionLayer tl(open_socket);
             TL_ERR_and_return(tl.write_string("(Server -> Client) Hello World"), tl.print_errors());
@@ -278,7 +218,7 @@ int main()
         {
             OpenSocket open_socket(CLIENT);
             socket_address server_address(ip, port);
-            open_socket.connect_to_server(server_address);
+            TL_ERR_and_return(open_socket.connect_to_server(server_address), printcout("timeout on connect"));
 
             TransmissionLayer tl(open_socket);
             std::string str;
@@ -319,7 +259,7 @@ int main()
 
     server_thread.join();
     client_thread.join();
-#endif
+
 
     return 0;
 }
