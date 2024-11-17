@@ -14,6 +14,8 @@
 #include <chrono>
 
 
+namespace distribsys{
+
 
 enum SOCKET_TYPE
 {
@@ -32,8 +34,8 @@ enum class error_code
 
 
 constexpr in_port_t DEFAULT_PORT = 8080;
+constexpr in_port_t DNS_PORT = 8989;
 constexpr int MAX_MESSAGE_SIZE = 4096;
-constexpr int BACKLOG = 5;
 
 constexpr int TRANSMISSION_LAYER_HEADER = sizeof(int) + sizeof(bool); // datalen + batches_continue
 constexpr int MAX_DATA_SIZE = MAX_MESSAGE_SIZE - TRANSMISSION_LAYER_HEADER;
@@ -96,15 +98,32 @@ public:
                                          sock_type(sock_type_)
     {
     }
-
-    void accept_connection(in_port_t server_fd)
+    //% return true if timeout
+    [[nodiscard]]
+    bool accept_connection(in_port_t server_fd, TimeValue timeout = NO_DELAY)
     { // server file descriptor
         throw_if(sock_type != SERVER, "Cannot accept connection on client socket");
         throw_if(valid, "Cannot accept, socket already valid");
 
+        set_timeout_throw(server_fd, timeout);
+
         struct sockaddr_in client_address;    // overwritten by accept
         int addrlen = sizeof(client_address); // overwritten by accept
-        allocated_fd = accept(server_fd, (struct sockaddr *)&client_address, (socklen_t *)&addrlen);
+        TimeValue start = TimeValue::now();
+        while(true){//wait for connection
+            allocated_fd = accept(server_fd, (struct sockaddr *)&client_address, (socklen_t *)&addrlen);
+            if(allocated_fd<0){
+                if(errno==EINTR||errno==EAGAIN||errno==EWOULDBLOCK){
+                    if(!timeout.is_near(0) && TimeValue::now()-start>timeout){
+                        return true;
+                    }else{
+                        continue;
+                    }
+                }else{
+                    break;
+                }
+            }
+        }
         throw_if(allocated_fd < 0,
                  prints_new("Failed to accept connection, errno:", errno));
 
@@ -118,8 +137,10 @@ public:
         MUTEX_PRINT(prints_new("Accepted connection from client: ", socket_address_to_string(other_address),
                                " to server: ", socket_address_to_string(socket_address::from_fd_local(allocated_fd))));
         valid = true;
+        return false;
     }
-    void connect_to_server(socket_address address)
+    [[nodiscard]]
+    bool connect_to_server(socket_address address, TimeValue timeout = NO_DELAY)
     {
         throw_if(sock_type != CLIENT, "Cannot connect to server on server socket");
         throw_if(valid, "Cannot connect, socket already valid");
@@ -128,11 +149,27 @@ public:
         allocated_fd = create_socket_throw();
 
         set_socket_options_throw(allocated_fd);
+        set_timeout_throw(allocated_fd, timeout);
 
         struct sockaddr_in server_address = address.to_sockaddr_in();
 
-        throw_if(connect(allocated_fd, (struct sockaddr *)&server_address, sizeof(server_address)) < 0,
-                 prints_new("Failed to connect to server, errno:", errno));
+        int res;
+        TimeValue start = TimeValue::now();
+        while(true){//wait for connection
+            res = connect(allocated_fd, (struct sockaddr *)&server_address, sizeof(server_address));
+            if(res<0){
+                if(errno==EINTR||errno==EAGAIN||errno==EWOULDBLOCK){
+                    if(!timeout.is_near(0) && TimeValue::now()-start>timeout){
+                        return true;
+                    }else{
+                        continue;
+                    }
+                }else{
+                    break;
+                }
+            }
+        }
+        throw_if(res < 0, prints_new("Failed to connect to server, errno:", errno));
 
         other_address = address;
 
@@ -144,6 +181,7 @@ public:
         MUTEX_PRINT(prints_new("Connected to server: ", socket_address_to_string(other_address),
                                " from client: ", socket_address_to_string(socket_address::from_fd_local(allocated_fd))));
         valid = true;
+        return false;
     }
     [[nodiscard]]
     ssize_t Send(int fd, const void *buf, size_t len, int flags)
@@ -395,6 +433,12 @@ class TransmissionLayer{
     bool write_bytes(const char* arr, int size){
         return send_if_dont_fit(arr, size);
     }
+    template<typename T>
+    [[nodiscard]]
+    bool write_type(const T& val){
+        static_assert(std::is_trivially_copyable<T>::value, "Type must be trivially copyable");
+        return write_bytes(reinterpret_cast<const char*>(&val), sizeof(T));
+    }
     [[nodiscard]]
     bool finalize_send(){
         return construct_and_send(0);
@@ -530,6 +574,12 @@ class TransmissionLayer{
     bool read_bytes(char* arr, int size){
         return recv_if_not_enough(arr, size);
     }
+    template<typename T>
+    [[nodiscard]]
+    bool read_type(T& val){
+        static_assert(std::is_trivially_copyable<T>::value, "Type must be trivially copyable");
+        return read_bytes(reinterpret_cast<char*>(&val), sizeof(T));
+    }
     void print_errors(){
         double throughput;
         switch(last_error){
@@ -556,3 +606,5 @@ class TransmissionLayer{
     }
 };
 
+
+}//namespace distribsys

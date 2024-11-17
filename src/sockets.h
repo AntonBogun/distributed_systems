@@ -11,6 +11,9 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <thread>
+#include <mutex>
+namespace distribsys{
 
 #define throw_if(condition, message)       \
     if (condition)                         \
@@ -254,7 +257,19 @@ void set_socket_options_throw(int socket_fd)
     throw_if(setsockopt(socket_fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt)) < 0,
              prints_new("Failed to set SO_KEEPALIVE, errno:", errno));
 }
-
+void set_timeout_throw(int socket_fd, TimeValue timeout)
+{
+    struct timeval tv = timeout.to_timeval();
+    throw_if(setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0,
+             prints_new("Failed to set SO_RCVTIMEO, errno:", errno));
+    throw_if(setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0,
+             prints_new("Failed to set SO_SNDTIMEO, errno:", errno));
+}
+u64 get_thread_id()
+{
+    //can't rely on get_id being u64
+    return std::hash<std::thread::id>{}(std::this_thread::get_id());
+}
 //% true means error + errno set
 [[nodiscard]]
 bool set_socket_send_timeout(int socket_fd, TimeValue timeout)
@@ -268,3 +283,56 @@ bool set_socket_recv_timeout(int socket_fd, TimeValue timeout)
     struct timeval tv = timeout.to_timeval();
     return setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0;
 }
+
+
+constexpr int BACKLOG = 5;
+class ServerSocket
+{
+    int socket_fd;
+
+public:
+    bool connection_open = false;
+    ServerSocket(in_port_t port)
+    {
+
+        socket_fd = create_socket_throw();
+
+        set_socket_options_throw(socket_fd);
+
+        // struct sockaddr_in server_address;
+        // server_address.sin_family = AF_INET;
+        // server_address.sin_addr.s_addr = htonl(INADDR_ANY);
+        // server_address.sin_port = htons(PORT);
+        struct sockaddr_in bind_address = socket_address(0, 0, 0, 0, port).to_sockaddr_in(); // 0,0,0,0 to bind to all interfaces
+        throw_if(bind(socket_fd, (struct sockaddr *)&bind_address, sizeof(bind_address)) < 0,
+                 prints_new("Failed to bind socket, errno:", errno));
+
+        socket_address bound_address = socket_address::from_fd_local(socket_fd);
+
+        throw_if(bound_address.port != port,
+                 prints_new("Bind port mismatch: bound ", bound_address.port, " != target ", port));
+
+        printcout(prints_new("Server socket bound to: ", socket_address_to_string(bound_address)));
+
+        throw_if(listen(socket_fd, BACKLOG) < 0,
+                 prints_new("Failed to listen, errno:", errno));
+
+        printcout("Listening for connections...");
+    }
+
+    int get_socket_fd()
+    {
+        return socket_fd;
+    }
+    void close_socket()
+    {
+        close(socket_fd);
+    }
+    ~ServerSocket()
+    {
+        close_socket();
+    }
+};
+
+
+}//namespace distribsys
