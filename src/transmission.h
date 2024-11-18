@@ -122,7 +122,7 @@ public:
                 }else{
                     break;
                 }
-            }
+            } else {break;}
         }
         throw_if(allocated_fd < 0,
                  prints_new("Failed to accept connection, errno:", errno));
@@ -167,7 +167,7 @@ public:
                 }else{
                     break;
                 }
-            }
+            } else {break;}
         }
         throw_if(res < 0, prints_new("Failed to connect to server, errno:", errno));
 
