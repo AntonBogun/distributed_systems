@@ -2,6 +2,7 @@
 #include "transmission.h"
 #include "utils.h"
 #include "nodes.h"
+#include "packets.h"
 
 #include <algorithm>
 #include <chrono>
@@ -106,7 +107,7 @@ std::vector<ipv4_addr> getIPAddresses()
         }                       \
     }
 
-int main()
+int test()
 {
 
     //==== testing
@@ -261,6 +262,140 @@ int main()
     client_thread.join();
 
 
+    return 0;
+}
+// g++ -std=c++17 -o main main.cpp -Wall -Wextra -Wshadow
+
+
+/* Steps:
+    - check if 2 processes can exchange byte stream and parse correctly
+    - transform to thread which is triggered in Datanode's and Master's constructor
+*/
+
+int main(int argc, char *argv[])
+{
+    // Parse argument
+    if (argc != 3) {
+        std::cout << "Usage: ./main -mode <client|data|master|dns> -p <port_num>" << std::endl;
+        return -1;
+    }
+    std::string mode = argv[2];
+
+    std::vector<ipv4_addr> addresses = getIPAddresses();
+    if (addresses.empty())
+    {
+        throw std::runtime_error("No network interfaces found");
+    }
+    ipv4_addr ip = addresses[0];
+    printcout(prints_new("using ip: ", ip_to_string(ip)));
+    
+
+    socket_address dnsAddress(ip, 8089);
+
+    if (mode == "client") {
+        std::cout << "==> HL: " << "Enter client mode." << std::endl;
+
+        in_port_t port = 8080;
+
+        OpenSocket open_socket(CLIENT);
+        socket_address server_address(ip, port);
+        open_socket.connect_to_server(server_address);
+
+        TransmissionLayer tl(open_socket);
+
+        // Example to send string
+        // std::string str;
+        // tl.initialize_recv();
+        // tl.read_string(str);
+        // printcout(prints_new("Received: ", str));
+        // tl.write_string("(Client -> Server) Hello World");
+        // tl.finalize_send();
+
+        // Example to send bytes
+        // make bytes array
+        PACKET_ID packID = HEARTBEAT;
+        int payloadSize = 1;
+
+        tl.write_byte(packID);
+        tl.write_i32(payloadSize);
+
+        tl.finalize_send();
+        
+        
+
+        // i64 sum = 0;
+        // i32 expected = 0;
+        // for (int i = 0; i < vector_n; i++)
+        // {
+        //     TL_ERR_and_return(tl.read_i32(v[i]), tl.print_errors());
+        //     sum += v[i];
+        //     if (v[i] != expected)
+        //     {
+        //         printcout(prints_new("Mismatch at i: ", i, " expected: ", expected, " got: ", v[i]));
+        //         break;
+        //     }
+        //     expected++;
+        // }
+        // printcout(prints_new("Sum: ", sum));
+        // printcout(prints_new("final client throughput: ", rate_to_string(tl.get_throughput())));
+    } else if (mode == "server")
+    {
+        // TODO: HoangLe [Nov-17]: Initialize server mode
+
+        std::cout << "==> HL: " << "Enter server mode." << std::endl;
+
+        in_port_t port = 8080;
+
+
+        // ServerSocket server_socket(port);
+        // int server_fd = server_socket.get_socket_fd();
+
+        // OpenSocket open_socket(SERVER);
+        // open_socket.accept_connection(server_fd);
+
+        
+        // TransmissionLayer tl(open_socket);
+        // tl.initialize_recv();
+
+        // // = Steps to receive
+        // // 1. Read byte
+        // u8 byte;
+        // tl.read_byte(byte);
+        // PACKET_ID packeID = static_cast<PACKET_ID>(byte);
+
+        // int payloadSize;
+        // tl.read_i32(payloadSize);
+        // switch (packeID)
+        // {
+        // case HEARTBEAT:
+        //     std::cout << "== HL: " << "payloadSize = " << payloadSize << std::endl;
+        //     break;
+        
+        // default:
+        //     break;
+        // }
+
+        Server server(dnsAddress, port);
+
+
+
+        // tl.write_string("(Server -> Client) Hello World");
+        // tl.finalize_send();
+        // std::string str;
+        // tl.initialize_recv();
+        // tl.read_string(str);
+        // printcout(prints_new("Received: ", str));
+
+    } else if (mode == "dns")
+    {
+        // TODO: HoangLe [Nov-17]: Initialize dns
+
+        std::cout << "==> HL: " << "Enter DNS mode." << std::endl;
+    } else {
+        std::cout << "Err: invalid arg 'mode'" << std::endl;
+        return -1;
+    }
+    
     return 0;
 }
 // g++ -std=c++17 -o main main.cpp -Wall -Wextra -Wshadow
