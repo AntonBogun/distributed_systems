@@ -20,14 +20,34 @@ class Node{
 class Server: public Node
 {
 public:
+    ServerSocket server_socket;
+
+    Server(socket_address dns_address_, in_port_t port): Node(dns_address_), server_socket(port) {}
+
+    void start(){}
+};
+class DataNode: public Server
+{
+public:
     std::queue<Packet> packets;
     std::mutex mutexPackets;
     std::condition_variable cv;
     bool isPacketsReady = false;
 
-    ServerSocket server_socket;
+    socket_address addrMaster; 
 
-    Server(socket_address dns_address_, in_port_t port): Node(dns_address_), server_socket(port) {}
+    DataNode(socket_address dns_address_, in_port_t port):
+    Server(dns_address_, port){}
+
+    void start(){
+        std::thread listenThread(&DataNode::listen, this);
+        std::thread consumeThread(&DataNode::consume, this);
+        std::thread miscThread(&DataNode::doMiscTasks, this);
+
+        miscThread.join();
+        listenThread.join();
+        consumeThread.join();
+    }
 
     void listen() {
         while (true)
@@ -37,22 +57,8 @@ public:
             OpenSocket open_socket(SERVER);
             open_socket.accept_connection(server_socket.get_socket_fd());
 
-            TransmissionLayer tl(open_socket);
-            tl.initialize_recv();
-
             // Parse incoming stream to packet
-            u8 byte;
-            tl.read_byte(byte);
-            PACKET_ID packetID = static_cast<PACKET_ID>(byte);
-
-            int payloadSize;
-            tl.read_i32(payloadSize);
-            std::vector<u8> payload(payloadSize, 0);
-
-            for (int i = 0; i < payloadSize; ++i)
-                tl.read_byte(payload[i]);
-
-            Packet packet = Packet(packetID, payloadSize, payload);
+            Packet packet = Packet(open_socket);
 
             // Add parsed packet to queue
             std::lock_guard<std::mutex> lockGuard(mutexPackets);
@@ -76,25 +82,30 @@ public:
                 Packet packet = packets.front();
                 std::cout << "==> HL: " << "Consume packet : " << packet.packetID << std::endl;
                 packets.pop();
+
+                switch (packet.packetID)
+                {
+                    case ASK_IP_ACK: {
+                        addrMaster = packet.addrParsed;
+
+                        std::cout << "==> HL: " << "DNS replies the current Master node address: " << socket_address_to_string(addrMaster) << std::endl;
+
+                        break;
+                    }
+                }
             }
             
             isPacketsReady = false;
         }
     }
-};
-class DataNode: public Server
-{
-public:
-    socket_address master_address; 
-    DataNode(socket_address dns_address_, in_port_t port, socket_address master_address_):
-    Server(dns_address_, port), master_address(master_address_){}
 
-    void start(){
-        std::thread listenThread(&DataNode::listen, this);
-        std::thread consumeThread(&DataNode::consume, this);
+    void doMiscTasks() {
+        // 1. Ask DNS about the socket of current Master
+        Packet packetDNSAskMaster = Packet::compose_ASK_IP();
+        packetDNSAskMaster.send(dns_address);
 
-        listenThread.join();
-        consumeThread.join();
+        // 2. Notify the current MasterNode (if exist)
+        // TODO: HoangLe [Nov-19]: Implement this
     }
 
 };
@@ -115,23 +126,26 @@ public:
     std::mutex mutexInfoDataNode;
 
     MasterNode(socket_address dns_address_, in_port_t port, int durationHeartbeat):
-    DataNode(dns_address_, port, socket_address(0,0,0,0,0)),
+    DataNode(dns_address_, port),
     durationHeartbeat(durationHeartbeat)
     {}
 
     void start(){
+        std::thread miscThread(&MasterNode::doMiscTasks, this);
         std::thread listenThread(&MasterNode::listen, this);
-        // std::thread miscThread(doMiscTasks);
+        std::thread consumeThread(&MasterNode::consume, this);
         std::thread heartbeatThread(&MasterNode::sendHeartBeat, this);
 
+        miscThread.join();
         listenThread.join();
-        // miscThread.join();
         heartbeatThread.join();
+        consumeThread.join();
     }
 
     void doMiscTasks() {
         // 1. Notify DNS about the existence
-        // TODO: HoangLe [Nov-19]: Implement this
+        Packet packetDNSNotify = Packet::compose_NOTIFY(NODE_TYPE::MASTER);
+        packetDNSNotify.send(dns_address);
 
         // 2. Notify the current MasterNode (if exist)
         // TODO: HoangLe [Nov-19]: Implement this
@@ -171,8 +185,44 @@ public:
 
 class DNS : public Server
 {
+    socket_address addrCurMaster;
 public:
     DNS():Server(socket_address(0,0,0,0,0), DNS_PORT){}
+
+    void start() {
+        while (true)
+        {
+            OpenSocket open_socket(SERVER);
+            open_socket.accept_connection(server_socket.get_socket_fd());
+
+            Packet packet = Packet(open_socket);
+
+            std::cout << "==> HL: " << "After parsing: " << static_cast<int>(packet.packetID) << " | " << static_cast<int>(packet.typeNotifyingNode) << std::endl;
+
+
+            switch (packet.packetID)
+            {
+                case NOTIFY: {
+                    addrCurMaster = packet.addrSrc;
+
+                    std::cout << "==> HL: " << "Signed up new Master at: " << socket_address_to_string(addrCurMaster) << std::endl;
+
+                    break;
+                }
+
+                case ASK_IP: {
+                    Packet packetReply =  Packet::compose_ASK_IP_ACK(addrCurMaster);
+                    packet.addrSrc.port = 8081;
+                    packetReply.send(packet.addrSrc);
+
+                    std::cout << "==> HL: " << "Reply " << socket_address_to_string(packet.addrSrc) << ": " << socket_address_to_string(addrCurMaster) << std::endl;
+
+                    break;
+                }
+            }
+            
+        }
+    }
 };
 
 // ================================================================

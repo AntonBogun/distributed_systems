@@ -290,7 +290,16 @@ int main(int argc, char *argv[])
     printcout(prints_new("using ip: ", ip_to_string(ip)));
     
 
-    socket_address dnsAddress(ip, 8089);
+    socket_address dnsAddress(ip, DNS_PORT);
+
+
+    // NOTE: HoangLe [Nov-20]: These are temporary
+    constexpr in_port_t DATA_PORT = 8081;
+    constexpr in_port_t MASTER_PORT = 8080;
+
+
+    constexpr int DURATION_HEARBEAT = 2;     // in seconds;
+
 
     if (mode == "client") {
         std::cout << "==> HL: " << "Enter client mode." << std::endl;
@@ -320,85 +329,27 @@ int main(int argc, char *argv[])
         tl.write_i32(payloadSize);
 
         tl.finalize_send();
-        
-        
-
-        // i64 sum = 0;
-        // i32 expected = 0;
-        // for (int i = 0; i < vector_n; i++)
-        // {
-        //     TL_ERR_and_return(tl.read_i32(v[i]), tl.print_errors());
-        //     sum += v[i];
-        //     if (v[i] != expected)
-        //     {
-        //         printcout(prints_new("Mismatch at i: ", i, " expected: ", expected, " got: ", v[i]));
-        //         break;
-        //     }
-        //     expected++;
-        // }
-        // printcout(prints_new("Sum: ", sum));
-        // printcout(prints_new("final client throughput: ", rate_to_string(tl.get_throughput())));
     } else if (mode == "master")
     {
         std::cout << "==> HL: " << "Enter master mode." << std::endl;
 
-        in_port_t port = 8080;
-
-
-        // ServerSocket server_socket(port);
-        // int server_fd = server_socket.get_socket_fd();
-
-        // OpenSocket open_socket(SERVER);
-        // open_socket.accept_connection(server_fd);
-
-        
-        // TransmissionLayer tl(open_socket);
-        // tl.initialize_recv();
-
-        // // = Steps to receive
-        // // 1. Read byte
-        // u8 byte;
-        // tl.read_byte(byte);
-        // PACKET_ID packeID = static_cast<PACKET_ID>(byte);
-
-        // int payloadSize;
-        // tl.read_i32(payloadSize);
-        // switch (packeID)
-        // {
-        // case HEARTBEAT:
-        //     std::cout << "== HL: " << "payloadSize = " << payloadSize << std::endl;
-        //     break;
-        
-        // default:
-        //     break;
-        // }
-
-        // Server server(dnsAddress, port);
-        MasterNode master(dnsAddress, port, 2);
+        MasterNode master(dnsAddress, MASTER_PORT, DURATION_HEARBEAT);
         master.start();
-
-
-
-        // tl.write_string("(Server -> Client) Hello World");
-        // tl.finalize_send();
-        // std::string str;
-        // tl.initialize_recv();
-        // tl.read_string(str);
-        // printcout(prints_new("Received: ", str));
 
     } else if (mode == "data")
     {
-        std::cout << "==> HL: " << "Enter ata mode." << std::endl;
+        std::cout << "==> HL: " << "Enter Data mode." << std::endl;
 
-        socket_address masterAddress(ip, 8080);
-        DataNode data(dnsAddress, 8081, masterAddress);
+        DataNode data(dnsAddress, DATA_PORT);
         data.start();
 
     } else if (mode == "dns")
     {
-        // TODO: HoangLe [Nov-17]: Initialize dns
-
         std::cout << "==> HL: " << "Enter DNS mode." << std::endl;
+
+        DNS dns;
+        dns.start();
+
     } else {
         std::cout << "Err: invalid arg 'mode'" << std::endl;
         return -1;
