@@ -268,7 +268,7 @@ int test()
 
 
 /* Steps:
-    - check if 2 processes can exchange byte stream and parse correctly
+    - [Done] check if 2 processes can exchange byte stream and parse correctly
     - transform to thread which is triggered in Datanode's and Master's constructor
 */
 
@@ -314,7 +314,7 @@ int main(int argc, char *argv[])
         // Example to send bytes
         // make bytes array
         PACKET_ID packID = HEARTBEAT;
-        int payloadSize = 1;
+        int payloadSize = 0;
 
         tl.write_byte(packID);
         tl.write_i32(payloadSize);
@@ -338,11 +338,9 @@ int main(int argc, char *argv[])
         // }
         // printcout(prints_new("Sum: ", sum));
         // printcout(prints_new("final client throughput: ", rate_to_string(tl.get_throughput())));
-    } else if (mode == "server")
+    } else if (mode == "master")
     {
-        // TODO: HoangLe [Nov-17]: Initialize server mode
-
-        std::cout << "==> HL: " << "Enter server mode." << std::endl;
+        std::cout << "==> HL: " << "Enter master mode." << std::endl;
 
         in_port_t port = 8080;
 
@@ -375,7 +373,9 @@ int main(int argc, char *argv[])
         //     break;
         // }
 
-        Server server(dnsAddress, port);
+        // Server server(dnsAddress, port);
+        MasterNode master(dnsAddress, port, 2);
+        master.start();
 
 
 
@@ -385,6 +385,14 @@ int main(int argc, char *argv[])
         // tl.initialize_recv();
         // tl.read_string(str);
         // printcout(prints_new("Received: ", str));
+
+    } else if (mode == "data")
+    {
+        std::cout << "==> HL: " << "Enter ata mode." << std::endl;
+
+        socket_address masterAddress(ip, 8080);
+        DataNode data(dnsAddress, 8081, masterAddress);
+        data.start();
 
     } else if (mode == "dns")
     {
@@ -399,3 +407,5 @@ int main(int argc, char *argv[])
     return 0;
 }
 // g++ -std=c++17 -o main main.cpp -Wall -Wextra -Wshadow
+// master: ./bin/main -mode master
+// data: ./bin/main -mode data

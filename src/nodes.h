@@ -21,7 +21,9 @@ class Server: public Node
 {
 public:
     std::queue<Packet> packets;
-    std::mutex lockPackets;
+    std::mutex mutexPackets;
+    std::condition_variable cv;
+    bool isPacketsReady = false;
 
     ServerSocket server_socket;
 
@@ -30,6 +32,8 @@ public:
     void listen() {
         while (true)
         {
+            std::cout << "==> HL: " << "Enter inside listen thread." << std::endl;
+
             OpenSocket open_socket(SERVER);
             open_socket.accept_connection(server_socket.get_socket_fd());
 
@@ -37,28 +41,44 @@ public:
             tl.initialize_recv();
 
             // Parse incoming stream to packet
-            // TODO: HoangLe [Nov-20]: Continue parsing
-            Packet packet = Packet();
             u8 byte;
             tl.read_byte(byte);
-            PACKET_ID packeID = static_cast<PACKET_ID>(byte);
+            PACKET_ID packetID = static_cast<PACKET_ID>(byte);
 
             int payloadSize;
             tl.read_i32(payloadSize);
-            switch (packeID)
-            {
-            case HEARTBEAT:
-                std::cout << "== HL: " << "payloadSize = " << payloadSize << std::endl;
-                break;
-            
-            default:
-                break;
-            }
+            std::vector<u8> payload(payloadSize, 0);
+
+            for (int i = 0; i < payloadSize; ++i)
+                tl.read_byte(payload[i]);
+
+            Packet packet = Packet(packetID, payloadSize, payload);
 
             // Add parsed packet to queue
-            std::unique_lock<std::mutex> lock(lockPackets);
+            std::lock_guard<std::mutex> lockGuard(mutexPackets);
             packets.push(packet);
-            std::lock_guard<std::mutex> lock(lockPackets);
+            std::cout << "==> HL: " << "Added packet to 'packets' : " << packets.size() << std::endl;
+
+            isPacketsReady = true;
+            cv.notify_one();
+        }
+    }
+
+    void consume() {
+        while (true)
+        {
+            std::unique_lock<std::mutex> lock(mutexPackets);
+            cv.wait(lock, [this] { return isPacketsReady; });
+
+
+            while (packets.size() > 0)
+            {
+                Packet packet = packets.front();
+                std::cout << "==> HL: " << "Consume packet : " << packet.packetID << std::endl;
+                packets.pop();
+            }
+            
+            isPacketsReady = false;
         }
     }
 };
@@ -67,9 +87,16 @@ class DataNode: public Server
 public:
     socket_address master_address; 
     DataNode(socket_address dns_address_, in_port_t port, socket_address master_address_):
-    Server(dns_address_, port), master_address(master_address_){
-        
+    Server(dns_address_, port), master_address(master_address_){}
+
+    void start(){
+        std::thread listenThread(&DataNode::listen, this);
+        std::thread consumeThread(&DataNode::consume, this);
+
+        listenThread.join();
+        consumeThread.join();
     }
+
 };
 
 // ================================================================
@@ -85,20 +112,20 @@ public:
     int durationHeartbeat;
 
     std::map<ipv4_addr, DataNodeInfo> infoDataNodes;
-    std::mutex lockInfoDataNode;
-
-    std::condition_variable cv;
+    std::mutex mutexInfoDataNode;
 
     MasterNode(socket_address dns_address_, in_port_t port, int durationHeartbeat):
     DataNode(dns_address_, port, socket_address(0,0,0,0,0)),
     durationHeartbeat(durationHeartbeat)
-    {
-        std::thread listenThread(listen);
-        std::thread miscThread(doMiscTasks);
-        std::thread heartbeatThread(sendHeartBeat);
+    {}
+
+    void start(){
+        std::thread listenThread(&MasterNode::listen, this);
+        // std::thread miscThread(doMiscTasks);
+        std::thread heartbeatThread(&MasterNode::sendHeartBeat, this);
 
         listenThread.join();
-        miscThread.join();
+        // miscThread.join();
         heartbeatThread.join();
     }
 
@@ -111,16 +138,32 @@ public:
     }
 
     void sendHeartBeat() {
-        std::this_thread::sleep_for(std::chrono::seconds(durationHeartbeat));
+        while (true)
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(durationHeartbeat));
 
-        std::unique_lock<std::mutex> lock(lockInfoDataNode);
-        cv.wait(
-            lock, 
-            [] { 
-                // TODO: HoangLe [Nov-20]: loop `infoDataNodes` and send heartbeat
-            }
-        );
-        std::unique_lock<std::mutex> lock(lockInfoDataNode);
+            // std::cout << "==> HL: " << "After waiting in heartbeat' : " << std::endl;
+
+            mutexInfoDataNode.lock();
+        
+            // TODO: HoangLe [Nov-20]: loop `infoDataNodes` and send heartbeat
+
+            OpenSocket open_socket(CLIENT);
+            socket_address addressDataNode(127, 0, 0, 1, 8081);
+            open_socket.connect_to_server(addressDataNode);
+
+            TransmissionLayer tl(open_socket);
+
+            // Example to send bytes
+            PACKET_ID packID = HEARTBEAT;
+            int payloadSize = 0;
+
+            tl.write_byte(packID);
+            tl.write_i32(payloadSize);
+            tl.finalize_send();
+
+            mutexInfoDataNode.unlock();
+        }
     }
 };
 

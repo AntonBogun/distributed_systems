@@ -6,7 +6,7 @@
 
 namespace distribsys{
 
-typedef std::vector<std::byte> BYTES;
+typedef std::vector<u8> BYTES;
 
 enum PACKET_ID : u8
 {
@@ -44,40 +44,41 @@ public:
 
     std::string fileName;
 
-    Packet(/* args */){}
+    Packet(PACKET_ID packetID, int payloadSize, BYTES payload):
+    packetID(packetID), payloadSize(payloadSize), payload(payload) {}
 
     static Packet fromSocket(BYTES data){
         // TODO: HoangLe [Nov-15]: Implement this
-        Packet packet;
+        // Packet packet;
 
-        packet.packetID = static_cast<PACKET_ID>(data[0]);
+        // packet.packetID = static_cast<PACKET_ID>(data[0]);
         
-        switch (packet.packetID)
-        {
-            // For Heartbeat
-            case HEARTBEAT:
-            case HEARTBEAT_ACK:
-                break;
+        // switch (packet.packetID)
+        // {
+        //     // For Heartbeat
+        //     case HEARTBEAT:
+        //     case HEARTBEAT_ACK:
+        //         break;
 
-            // For Replication
-            case REQUEST_SEND_REPLICA:
-                // TODO: HoangLe [Nov-15]: Implement thiss
-                break;
-            case SEND_REPLICA:
-                // TODO: HoangLe [Nov-15]: Implement thiss
-                break;
-            case SEND_REPLICA_ACK:
-                // TODO: HoangLe [Nov-15]: Implement thiss
-                break;
+        //     // For Replication
+        //     case REQUEST_SEND_REPLICA:
+        //         // TODO: HoangLe [Nov-15]: Implement thiss
+        //         break;
+        //     case SEND_REPLICA:
+        //         // TODO: HoangLe [Nov-15]: Implement thiss
+        //         break;
+        //     case SEND_REPLICA_ACK:
+        //         // TODO: HoangLe [Nov-15]: Implement thiss
+        //         break;
 
-            default:
-                break;
-        }
+        //     default:
+        //         break;
+        // }
     }
     void toBytes(){
         BYTES data;
 
-        data.push_back(static_cast<std::byte>(this->packetID));
+        data.push_back(static_cast<u8>(this->packetID));
 
         // TODO: HoangLe [Nov-15]: Implement this
     }
