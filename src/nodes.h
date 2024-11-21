@@ -29,6 +29,7 @@ public:
 class DataNode: public Server
 {
 public:
+    in_port_t port;
     std::queue<Packet> packets;
     std::mutex mutexPackets;
     std::condition_variable cv;
@@ -37,7 +38,7 @@ public:
     socket_address addrMaster; 
 
     DataNode(socket_address dns_address_, in_port_t port):
-    Server(dns_address_, port){}
+    Server(dns_address_, port), port(port){}
 
     void start(){
         std::thread listenThread(&DataNode::listen, this);
@@ -144,7 +145,7 @@ public:
 
     void doMiscTasks() {
         // 1. Notify DNS about the existence
-        Packet packetDNSNotify = Packet::compose_NOTIFY(NODE_TYPE::MASTER);
+        Packet packetDNSNotify = Packet::compose_NOTIFY(NODE_TYPE::MASTER, port);
         packetDNSNotify.send(dns_address);
 
         // 2. Notify the current MasterNode (if exist)
@@ -196,14 +197,11 @@ public:
             open_socket.accept_connection(server_socket.get_socket_fd());
 
             Packet packet = Packet(open_socket);
-
-            std::cout << "==> HL: " << "After parsing: " << static_cast<int>(packet.packetID) << " | " << static_cast<int>(packet.typeNotifyingNode) << std::endl;
-
-
             switch (packet.packetID)
             {
                 case NOTIFY: {
                     addrCurMaster = packet.addrSrc;
+                    addrCurMaster.port = packet.addrParsed.port;
 
                     std::cout << "==> HL: " << "Signed up new Master at: " << socket_address_to_string(addrCurMaster) << std::endl;
 
@@ -212,7 +210,6 @@ public:
 
                 case ASK_IP: {
                     Packet packetReply =  Packet::compose_ASK_IP_ACK(addrCurMaster);
-                    packet.addrSrc.port = 8081;
                     packetReply.send(packet.addrSrc);
 
                     std::cout << "==> HL: " << "Reply " << socket_address_to_string(packet.addrSrc) << ": " << socket_address_to_string(addrCurMaster) << std::endl;

@@ -264,38 +264,46 @@ int test()
 
     return 0;
 }
-// g++ -std=c++17 -o main main.cpp -Wall -Wextra -Wshadow
 
-
-/* Steps:
-    - [Done] check if 2 processes can exchange byte stream and parse correctly
-    - transform to thread which is triggered in Datanode's and Master's constructor
-*/
 
 int main(int argc, char *argv[])
 {
     // Parse argument
-    if (argc != 3) {
-        std::cout << "Usage: ./main -mode <client|data|master|dns> -p <port_num>" << std::endl;
-        return -1;
-    }
-    std::string mode = argv[2];
+    std::string mode;
+    in_port_t port = 0;
 
+    switch (argc)
+    {
+        case 3: {
+            mode = argv[2];
+            
+            if (mode == "data" || mode == "master") {
+                std::cout << "Mode 'data' or 'master' require port specified" << std::endl;
+                std::cout << "Usage: ./main -mode <client|data|master|dns> -p <port_num>" << std::endl;
+                return -1;
+            }
+            break;
+        }
+        case 5: {
+            mode = argv[2];
+            port = static_cast<in_port_t>(std::stoi(argv[4]));
+            break;
+        }
+        
+        default: {
+            std::cout << "Usage: ./main -mode <client|data|master|dns> [-p <port>]" << std::endl;
+            return -1;
+        }
+    }
+
+    // Determine DNS's IP and port
     std::vector<ipv4_addr> addresses = getIPAddresses();
     if (addresses.empty())
     {
         throw std::runtime_error("No network interfaces found");
     }
     ipv4_addr ip = addresses[0];
-    printcout(prints_new("using ip: ", ip_to_string(ip)));
-    
-
     socket_address dnsAddress(ip, DNS_PORT);
-
-
-    // NOTE: HoangLe [Nov-20]: These are temporary
-    constexpr in_port_t DATA_PORT = 8081;
-    constexpr in_port_t MASTER_PORT = 8080;
 
 
     constexpr int DURATION_HEARBEAT = 2;     // in seconds;
@@ -312,13 +320,11 @@ int main(int argc, char *argv[])
 
         TransmissionLayer tl(open_socket);
 
-        // Example to send string
-        // std::string str;
-        // tl.initialize_recv();
-        // tl.read_string(str);
-        // printcout(prints_new("Received: ", str));
-        // tl.write_string("(Client -> Server) Hello World");
-        // tl.finalize_send();
+        // TODO: HoangLe [Nov-21]: Implement this
+
+        // 1. Connect to DNS to get current Master's ip and port
+
+        // 2. Connect to current Master
 
         // Example to send bytes
         // make bytes array
@@ -333,14 +339,14 @@ int main(int argc, char *argv[])
     {
         std::cout << "==> HL: " << "Enter master mode." << std::endl;
 
-        MasterNode master(dnsAddress, MASTER_PORT, DURATION_HEARBEAT);
+        MasterNode master(dnsAddress, port, DURATION_HEARBEAT);
         master.start();
 
     } else if (mode == "data")
     {
         std::cout << "==> HL: " << "Enter Data mode." << std::endl;
 
-        DataNode data(dnsAddress, DATA_PORT);
+        DataNode data(dnsAddress, port);
         data.start();
 
     } else if (mode == "dns")

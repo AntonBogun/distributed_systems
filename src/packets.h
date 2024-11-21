@@ -8,8 +8,8 @@ namespace distribsys{
 
 typedef std::vector<u8> BYTES;
 
-inline void convInt16ToBytes(uint16_t &src, u8 *dst) {memcpy(dst, &src, sizeof src);}
-inline void convBytesToInt16(uint16_t &dst, u8 *src) {memcpy(src, &dst, sizeof dst);}
+inline void convUInt16ToBytes(uint16_t *src, uint8_t *dst) {memcpy(dst, src, 2);}
+inline void convBytesToUInt16(uint8_t *src, uint16_t *dst) {memcpy(dst, src, 2);}
 
 enum PACKET_ID : u8
 {
@@ -104,12 +104,19 @@ public:
                 addrParsed.ip.c = payload[2];
                 addrParsed.ip.d = payload[3];
 
+                convBytesToUInt16(&payload[4], &addrParsed.port);
+
                 break;
             }
         
 
-            case NOTIFY:
+            case NOTIFY: {
                 typeNotifyingNode = static_cast<NODE_TYPE>(payload[0]);
+                convBytesToUInt16(&payload[1], &addrParsed.port);
+
+                break;
+            }
+
 
             default:
                 break;
@@ -129,7 +136,7 @@ public:
         Packet packet;
 
         packet.packetID = ASK_IP_ACK;
-        packet.payloadSize = 4;
+        packet.payloadSize = 6;
 
         packet.payload.resize(packet.payloadSize);
         packet.payload[0] = addr.ip.a;
@@ -137,17 +144,21 @@ public:
         packet.payload[2] = addr.ip.c;
         packet.payload[3] = addr.ip.d;
 
+        convUInt16ToBytes(&addr.port, &packet.payload[4]);
+
         return packet;
     }
 
-    static Packet compose_NOTIFY(NODE_TYPE typeNotifyingNode){
+    static Packet compose_NOTIFY(NODE_TYPE typeNotifyingNode, in_port_t port){
         Packet packet;
 
         packet.packetID = NOTIFY;
-        packet.payloadSize = 1;
+        packet.payloadSize = 3;
 
         packet.payload.resize(packet.payloadSize);
         packet.payload[0] = typeNotifyingNode;
+
+        convUInt16ToBytes(&port, &packet.payload[1]);
 
         return packet;
     }
