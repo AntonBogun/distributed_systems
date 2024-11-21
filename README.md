@@ -3,10 +3,9 @@ Compile with
 `g++ -std=c++17 -o main main.cpp -Wall -Wextra -Wshadow`
 
 # 1. Features
-- DNS
-- Heartbeat from Master to Data
+- [Done] DNS: Master can sign up its IP + port and Data node can connect to get Master's IP and port
+- [Done] Heartbeat and Hearbeat_ACK
 
-- TODO: Server maintains a map of available Data nodes and only sends heartbeat to these nodes
 
 # 2. System initialization
 
@@ -19,7 +18,7 @@ Currently they are run on the same machine. Do in following orders:
 > ./bin/main -mode dns
 
 2. Initialize Master
-> ./bin/main -mode master
+> ./bin/main -mode master -p 52345
 
 3. Initialize Data
-> ./bin/main -mode data
+> ./bin/main -mode data -p 52345

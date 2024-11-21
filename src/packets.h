@@ -98,6 +98,11 @@ public:
                 // TODO: HoangLe [Nov-15]: Implement thiss
                 break;
 
+            case ASK_IP: {
+                convBytesToUInt16(&payload[0], &addrParsed.port);
+
+                break;
+            }
             case ASK_IP_ACK: {
                 addrParsed.ip.a = payload[0];
                 addrParsed.ip.b = payload[1];
@@ -123,11 +128,32 @@ public:
         }
     }
 
-    static Packet compose_ASK_IP(){
+    static Packet compose_HEARTBEAT() {
+        Packet packet;
+
+        packet.packetID = HEARTBEAT;
+        packet.payloadSize = 0;
+
+        return packet;
+    }
+
+    static Packet compose_HEARTBEAT_ACK() {
+        Packet packet;
+
+        packet.packetID = HEARTBEAT_ACK;
+        packet.payloadSize = 0;
+
+        return packet;
+    }
+
+    static Packet compose_ASK_IP(in_port_t port){
         Packet packet;
 
         packet.packetID = ASK_IP;
-        packet.payloadSize = 0;
+        packet.payloadSize = 2;
+
+        packet.payload.resize(packet.payloadSize);
+        convUInt16ToBytes(&port, &packet.payload[0]);
 
         return packet;
     }
@@ -177,9 +203,7 @@ public:
             tl.write_byte(payload[i]);
 
         tl.finalize_send();
-
     }
-
 
     ~Packet(){}
 };
