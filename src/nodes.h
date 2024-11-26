@@ -8,9 +8,11 @@
 #include <thread>
 #include <bits/stdc++.h>
 #include <queue>
+#include <map>
 
 namespace distribsys{
 
+constexpr int MAX_NONRESPONSE_HEARTBEART = 2;
 
 class Node{
     public:
@@ -39,6 +41,8 @@ public:
     socket_address addrMaster; 
     std::mutex mutexAddrMaster;
     bool isAddrMasterReady = false;
+
+    std::vector<std::string> files;
 
     DataNode(socket_address dns_address_, in_port_t port):
     Server(dns_address_, port), port(port){}
@@ -130,10 +134,24 @@ public:
 };
 
 // ================================================================
-struct DataNodeInfo
+class DataNodeInfo
 {
-    // TODO: HoangLe [Nov-20]: Implement this: contain info about specific Data node
-    int num_nonresponse_heartbeat;
+public:
+    socket_address addr;
+    NODE_TYPE typeNode;
+    std::vector<std::string> files;
+
+    int numNonRespHeartBeat;
+    int numAvaiSlots;
+
+    DataNodeInfo(NODE_TYPE typeNode, socket_address addr): typeNode(typeNode), addr(addr) {}
+};
+
+class FileInfo
+{
+public:
+    std::string name;
+    std::vector<DataNodeInfo *> nodesData;
 };
 
 class MasterNode : public DataNode
@@ -141,9 +159,7 @@ class MasterNode : public DataNode
 public:
     int durationHeartbeat;
 
-    std::map<ipv4_addr, DataNodeInfo> infoDataNodes;
-    // NOTE: HoangLe [Nov-21]: This `addrDataNode` is for testing only. Later must loop through `infoDataNodes` 
-    socket_address addrDataNode;
+    std::map<std::string, DataNodeInfo> infoDataNodes;
     bool isDataNodeAvailable = false;
     std::mutex mutexInfoDataNode;
 
@@ -151,6 +167,13 @@ public:
     MasterNode(socket_address dns_address_, in_port_t port, int durationHeartbeat):
     DataNode(dns_address_, port), durationHeartbeat(durationHeartbeat)
     {}
+
+    std::string convAddr2Str(socket_address &addr){
+        return std::to_string(addr.ip.a)
+            + "-" + std::to_string(addr.ip.b)
+            + "-" + std::to_string(addr.ip.c)
+            + "-" + std::to_string(addr.ip.d);
+    }
 
     void start(){
         std::thread miscThread(&MasterNode::doMiscTasks, this);
@@ -179,22 +202,29 @@ public:
                 switch (packet.packetID)
                 {
                     case HEARTBEAT_ACK: {
-                        std::cout << "==> HL: " << "Master receives HEARTBEAT_ACK from Data node at: " << socket_address_to_string(addrDataNode) << std::endl;
+                        std::cout << "==> HL: " << "Master receives HEARTBEAT_ACK from Data node at: " << socket_address_to_string(packet.addrSrc) << std::endl;
+
+                        auto record = infoDataNodes.find(convAddr2Str(packet.addrSrc));
+                        if (record != infoDataNodes.end()) {
+                            DataNodeInfo& info = record->second;
+                            
+                            info.numNonRespHeartBeat--;
+                        }
+
                         break;
                     }
                     case NOTIFY: {
-                        std::cout << "==> HL: " << "Master receives NOTIFY from Data node at: " << socket_address_to_string(addrDataNode) << std::endl;
+                        std::cout << "==> HL: " << "Master receives NOTIFY from Data node at: " << socket_address_to_string(packet.addrSrc) << std::endl;
 
                         mutexInfoDataNode.lock();
+                        socket_address addrDataNode = packet.addrSrc;
                         addrDataNode = packet.addrSrc;
                         addrDataNode.port = packet.addrParsed.port;
 
+                        infoDataNodes.insert({convAddr2Str(addrDataNode), DataNodeInfo(NODE_TYPE::DATA, addrDataNode)});
 
                         isDataNodeAvailable = true;
                         mutexInfoDataNode.unlock();
-
-                        // TODO: HoangLe [Nov-21]: Add newly notified Data node to dict
-
                         break;
                     }
                 }
@@ -224,30 +254,32 @@ public:
 
             if (isDataNodeAvailable == true) {
                 Packet packetHeartbeat = Packet::compose_HEARTBEAT();
-                packetHeartbeat.send(addrDataNode);
 
-                std::cout << "==> HL: " << "Sent heartbeat to: " << socket_address_to_string(addrDataNode) << std::endl;
+                for (auto& [key, info]: infoDataNodes) {
+                    info.numNonRespHeartBeat++;
+
+                    if (info.numNonRespHeartBeat >= MAX_NONRESPONSE_HEARTBEART) {
+                        std::cout << "==> HL: " << "Trigger Replication with: " << socket_address_to_string(info.addr) << std::endl;
+                    }
+                    else {
+                        std::cout << "==> HL: " << "Sent heartbeat to: " << socket_address_to_string(info.addr) << std::endl;
+
+                        try {
+                            packetHeartbeat.send(info.addr);
+                        }
+                        catch (const std::runtime_error& err) {
+                            std::cout << "==> HL: " << "Cannot connect to: " << socket_address_to_string(info.addr) << std::endl;
+                        }
+                    }
+                }
+
             }
-
-        
-            // // TODO: HoangLe [Nov-20]: loop `infoDataNodes` and send heartbeat
-
-            // OpenSocket open_socket(CLIENT);
-            // socket_address addressDataNode(127, 0, 0, 1, 8081);
-            // open_socket.connect_to_server(addressDataNode);
-
-            // TransmissionLayer tl(open_socket);
-
-            // // Example to send bytes
-            // PACKET_ID packID = HEARTBEAT;
-            // int payloadSize = 0;
-
-            // tl.write_byte(packID);
-            // tl.write_i32(payloadSize);
-            // tl.finalize_send();
-
             mutexInfoDataNode.unlock();
         }
+    }
+
+    void replicate() {
+        // TODO: HoangLe [Nov-26]: Implement this
     }
 };
 
