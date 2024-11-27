@@ -171,7 +171,6 @@ public:
                     }
                 }
                 fileName = ss.str();
-                std::cout << "==> HL: " << "Done parsing fileName: " << fileName << std::endl;
 
                 // Parse binary
                 int posBinary = fileName.length() + 2;
@@ -179,7 +178,31 @@ public:
                 binary.resize(lenBinary);
 
                 memcpy(&binary[0], &payload[posBinary], lenBinary);
-                std::cout << "==> HL: " << "Done parsing binary with len " << lenBinary << std::endl;
+
+                break;
+            }
+
+            case DATANODE_SEND_DATA: {
+                // Parse file name
+                int lenFileName = payloadSize - 3;
+                std::stringstream ss;
+                for (int i = 0; i < payloadSize; ++i) {
+                    if (payload[i] == BYTE_SEP_CHARACTER) {
+                        if ((i < payloadSize - 2) && (payload[i + 1] == BYTE_SEP_CHARACTER)) 
+                            // This is the end of file name
+                            break;
+                    } else {
+                        ss << payload[i];
+                    }
+                }
+                fileName = ss.str();
+
+                // Parse binary
+                int posBinary = fileName.length() + 2;
+                int lenBinary = payloadSize - 2 - fileName.length();
+                binary.resize(lenBinary);
+
+                memcpy(&binary[0], &payload[posBinary], lenBinary);
 
                 break;
             }
@@ -344,6 +367,27 @@ public:
 
         // Dump byte READ_WRITE
         packet.payload[packet.payloadSize - 1] = req;
+
+        return packet;
+    }
+
+    static Packet compose_DATANODE_SEND_DATA(std::string name, std::vector<u8> &binary) {
+        Packet packet;
+
+        packet.packetID = DATANODE_SEND_DATA;
+        packet.payloadSize = name.length() + 2 + binary.size();
+
+        packet.payload.resize(packet.payloadSize);
+
+        // Dump file name to payload
+        memcpy(&packet.payload[0], name.data(), name.length());
+
+        // Dump 2 characters '||' to payload
+        packet.payload[name.length()] = BYTE_SEP_CHARACTER;
+        packet.payload[name.length() + 1] = BYTE_SEP_CHARACTER;
+
+        // Dump binary to payload
+        memcpy(&packet.payload[name.length() + 2], &binary[0], binary.size());
 
         return packet;
     }

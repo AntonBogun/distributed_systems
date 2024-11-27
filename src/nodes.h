@@ -14,6 +14,7 @@
 namespace distribsys{
 
 constexpr int MAX_NONRESPONSE_HEARTBEART = 2;
+const std::string DIR_ROOT_DATA = "data/";
 
 class Node{
     public:
@@ -77,7 +78,7 @@ public:
     }
 
     void writeFile(std::string &name, BYTES &data) {
-        std::ofstream wf("data/" + name, std::ios::out | std::ios::binary);
+        std::ofstream wf(DIR_ROOT_DATA + name, std::ios::out | std::ios::binary);
 
         throw_if(!wf, "Err: Cannot open file: " + name);
 
@@ -126,7 +127,29 @@ public:
                         writeFile(packet.fileName, packet.binary);
 
                         // Send ACK back to Master
-                        Packet::compose_CLIENT_REQUEST_ACK(REQUEST::UPLOAD, packet.fileName);
+                        Packet::compose_CLIENT_REQUEST_ACK(REQUEST::UPLOAD, packet.fileName).send(addrMaster);
+
+                        break;
+                    }
+
+                    case REQUEST_FROM_CLIENT: {
+                        // Read file
+                        std::string path = DIR_ROOT_DATA + packet.fileName;
+                        std::ifstream rf(path, std::ios::in | std::ios::binary);
+                        throw_if(!rf, "Err: Cannot open file: " + packet.fileName);
+                        
+                        std::vector<u8> binary((std::istreambuf_iterator<char>(rf)), (std::istreambuf_iterator<char>()));
+                        rf.close();
+
+                        // Send packet with binary
+                        socket_address addrClient = packet.addrSrc;
+                        addrClient = packet.addrSrc;
+                        addrClient.port = packet.addrParsed.port;
+
+                        Packet::compose_DATANODE_SEND_DATA(packet.fileName, binary).send(addrClient);
+
+                        // Send ACK back to Master
+                        Packet::compose_CLIENT_REQUEST_ACK(REQUEST::DOWNLOAD, packet.fileName).send(addrMaster);
 
                         break;
                     }
@@ -208,13 +231,11 @@ public:
         std::thread miscThread(&MasterNode::doMiscTasks, this);
         std::thread listenThread(&MasterNode::listen, this);
         std::thread consumeThread(&MasterNode::consume, this);
-        #// FIXME: HoangLe [Nov-27]: Enable this
-        // std::thread heartbeatThread(&MasterNode::sendHeartBeat, this);
+        std::thread heartbeatThread(&MasterNode::sendHeartBeat, this);
 
         miscThread.join();
         listenThread.join();
-        #// FIXME: HoangLe [Nov-27]: Enable this
-        // heartbeatThread.join();
+        heartbeatThread.join();
         consumeThread.join();
     }
 
@@ -287,7 +308,12 @@ public:
                         {
                             case REQUEST::UPLOAD: {
                                 std::string fileName = packet.fileName;
-                                // TODO: HoangLe [Nov-27]: Trigger replication with file `UPLOAD`
+                                // TODO: HoangLe [Nov-27]: Trigger replication with file packet.fileName 
+                                // Ideas: 
+                                //  1. use method findBestDataNode() to find best suitable node
+                                //  2. create packet and send it to the node holding the file to be replicated
+                                //  3. at the data node holding the file, send the packet embedded the file name and binary to the destined data node 
+                                //  4. both data nodes send ACK back to master
 
                                 break;
                             }
@@ -305,18 +331,31 @@ public:
                     }
 
                     case REQUEST_FROM_CLIENT: {
+                        socket_address addrClient = packet.addrSrc;
+                        addrClient = packet.addrSrc;
+                        addrClient.port = packet.addrParsed.port;
+
                         switch (packet.request)
                         {
-                            case REQUEST::DOWNLOAD : {
-                                // TODO: HoangLe [Nov-26]: Implement this:
+                            case REQUEST::DOWNLOAD: {
+                                auto info = infoFiles.find(packet.fileName);
+                                if (info == infoFiles.end()) {
+                                    // File not exist, refuse downloading
+                                    std::cout << "==> HL: " << "Cannot find Data node containing file '" << packet.fileName << std::endl;
+
+                                    Packet::compose_RESPONSE_NODE_IP().send(addrClient);
+                                } else {
+                                    DataNodeInfo *nodeInfo = info->second.nodesData[0];
+                                    std::cout << "==> HL: " << "Found Data node containing file '" << packet.fileName << "' : " << socket_address_to_string(nodeInfo->addr) << std::endl;
+                                    std::cout << "==> HL: " << "Send Data node's IP to '" << socket_address_to_string(addrClient) << std::endl;
+
+                                    Packet::compose_RESPONSE_NODE_IP(nodeInfo->addr).send(addrClient);
+                                }
+
                                 break;
                             }
 
                             case REQUEST::UPLOAD: {
-                                socket_address addrClient = packet.addrSrc;
-                                addrClient = packet.addrSrc;
-                                addrClient.port = packet.addrParsed.port;
-
                                 auto info = infoFiles.find(packet.fileName);
                                 if (info == infoFiles.end()) {
                                     // File not exist, allow write
@@ -499,6 +538,17 @@ public:
 
                         break;
                     }
+
+                    case DATANODE_SEND_DATA: {
+                        std::cout << "==> HL: " << "Data node sends data for file: " << packet.fileName << std::endl;
+
+
+                        std::string path = "received_" + packet.fileName;
+                        writeFile(path, packet.binary);
+
+                        std::exit(0);
+                        break;
+                    }
                 }
             }
             
@@ -548,17 +598,37 @@ public:
         consumeThread.join();
     }
 
-    void downloadFile(std::string name){
+    void downloadFile(std::string nameFile){
+        std::thread listenThread(&Client::listen, this);
+        std::thread consumeThread(&Client::consume, this);
+
         // 1. Connect to DNS to get current Master's ip and port
         Packet packetDNSAskMaster = Packet::compose_ASK_IP(port);
         packetDNSAskMaster.send(dns_address);
 
         // 2. Connect to current Master to ask the Data node holding file
-        // Packet packetAskFile
-        // TODO: HoangLe [Nov-26]: Implement this to ask to get file
+        std::unique_lock<std::mutex> lock(mutexAddrMaster);
+        cv.wait(lock, [this] { return isAddrMasterReady; });
+        
+        Packet packetAskFile = Packet::compose_ASK_READ_WRITE(REQUEST::DOWNLOAD, nameFile, port);
+        packetAskFile.send(addrMaster);
 
         // 3. Connect to assigned Data node
-        // TODO: HoangLe [Nov-26]: Implement this to ask to get file
+        std::unique_lock<std::mutex> lock2(mutexAddrData);
+        cv.wait(lock2, [this] { return isAddrDataReady; });
+
+        if (addrData.port == 0) {
+            std::cout << "==> HL: " << "No Data node storing the neeed file. Terminating..." << std::endl;
+            std::exit(0);
+        } else {    
+            std::cout << "==> HL: " << "Found Data node having needed file" << std::endl;
+
+            Packet packetBinary = Packet::compose_ASK_READ_WRITE(REQUEST::DOWNLOAD, nameFile, port);
+            packetBinary.send(addrData);
+        }
+
+        listenThread.join();
+        consumeThread.join();
     }
 
 };
