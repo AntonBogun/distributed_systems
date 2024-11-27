@@ -18,7 +18,12 @@ Currently they are run on the same machine. Do in following orders:
 > ./bin/main -mode dns
 
 2. Initialize Master
-> ./bin/main -mode master -p 52345
+> ./bin/main -mode master -p 52340
 
 3. Initialize Data
 > ./bin/main -mode data -p 52345
+
+3. Client
+> ./bin/main -mode client -p 52350 --upload monument.jpg
+
+

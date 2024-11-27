@@ -270,7 +270,9 @@ int main(int argc, char *argv[])
 {
     // Parse argument
     std::string mode;
-    in_port_t port = 0;
+    in_port_t port;
+    std::string nameFile;
+    std::string action = "";
 
     switch (argc)
     {
@@ -279,8 +281,8 @@ int main(int argc, char *argv[])
             
             if (mode == "data" || mode == "master") {
                 std::cout << "Mode 'data' or 'master' require port specified" << std::endl;
-                std::cout << "Usage: ./main -mode <client|data|master|dns> -p <port_num>" << std::endl;
-                return -1;
+                std::cout << "Usage: ./main -mode <client|data|master|dns> -p <port_num> [--path monument.jpg]" << std::endl;
+                std::exit(-1);
             }
             break;
         }
@@ -289,9 +291,33 @@ int main(int argc, char *argv[])
             port = static_cast<in_port_t>(std::stoi(argv[4]));
             break;
         }
+
+        case 7: {
+            mode = argv[2];
+
+            if (mode != "client") {
+                std::cout << "Usage: ./main -mode <client|data|master|dns> -p <port_num> [--download monument.jpg | --upload monument.jpg]" << std::endl;
+                std::exit(-1);
+            }
+
+            port = static_cast<in_port_t>(std::stoi(argv[4]));
+            nameFile = argv[6];
+
+            if (std::strcmp(argv[5], "--upload") == 0) {
+                action = "upload";
+            } else if (std::strcmp(argv[5], "--download") == 0) {
+                action = "download";
+            } else {
+                std::cout << "Err: Action should be either --download or --upload" << std::endl;
+                std::cout << "Usage: ./main -mode <client|data|master|dns> [-p <port>] [--download monument.jpg | --upload monument.jpg]" << std::endl;
+                return 1;
+            }
+
+            break;
+        }
         
         default: {
-            std::cout << "Usage: ./main -mode <client|data|master|dns> [-p <port>]" << std::endl;
+            std::cout << "Usage: ./main -mode <client|data|master|dns> [-p <port>] [--download monument.jpg | --upload monument.jpg]" << std::endl;
             return -1;
         }
     }
@@ -312,29 +338,15 @@ int main(int argc, char *argv[])
     if (mode == "client") {
         std::cout << "==> HL: " << "Enter client mode." << std::endl;
 
-        in_port_t port = 8080;
+        Client client(dnsAddress, port);
 
-        OpenSocket open_socket(CLIENT);
-        socket_address server_address(ip, port);
-        open_socket.connect_to_server(server_address);
-
-        TransmissionLayer tl(open_socket);
-
-        // TODO: HoangLe [Nov-21]: Implement this
-
-        // 1. Connect to DNS to get current Master's ip and port
-
-        // 2. Connect to current Master
-
-        // Example to send bytes
-        // make bytes array
-        PACKET_ID packID = HEARTBEAT;
-        int payloadSize = 0;
-
-        tl.write_byte(packID);
-        tl.write_i32(payloadSize);
-
-        tl.finalize_send();
+        if (action == "upload") {
+            client.uploadFile(nameFile);
+        } else if (action == "download") {
+            client.downloadFile(nameFile);
+        } else {
+            std::cout << "NotImplemented!" << std::endl;
+        }
     } else if (mode == "master")
     {
         std::cout << "==> HL: " << "Enter master mode." << std::endl;

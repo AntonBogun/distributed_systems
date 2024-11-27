@@ -7,6 +7,7 @@
 #include <mutex>
 #include <thread>
 #include <bits/stdc++.h>
+#include<fstream>
 #include <queue>
 #include <map>
 
@@ -38,7 +39,7 @@ public:
     std::mutex mutexPackets;
     bool isPacketsReady = false;
 
-    socket_address addrMaster; 
+    socket_address addrMaster;
     std::mutex mutexAddrMaster;
     bool isAddrMasterReady = false;
 
@@ -60,8 +61,6 @@ public:
     void listen() {
         while (true)
         {
-            // std::cout << "==> HL: " << "Enter inside listen thread." << std::endl;
-
             OpenSocket open_socket(SERVER);
             open_socket.accept_connection(server_socket.get_socket_fd());
 
@@ -71,11 +70,20 @@ public:
             // Add parsed packet to queue
             std::lock_guard<std::mutex> lockGuard(mutexPackets);
             packets.push(packet);
-            // std::cout << "==> HL: " << "Added packet to 'packets' : " << packets.size() << std::endl;
 
             isPacketsReady = true;
             cv.notify_one();
         }
+    }
+
+    void writeFile(std::string &name, BYTES &data) {
+        std::ofstream wf("data/" + name, std::ios::out | std::ios::binary);
+
+        throw_if(!wf, "Err: Cannot open file: " + name);
+
+        wf.write((char *)data.data(), data.size());
+
+        wf.close();
     }
 
     void consume() {
@@ -107,6 +115,18 @@ public:
                         cv.notify_one();
 
                         std::cout << "==> HL: " << "DNS replies the current Master node address: " << socket_address_to_string(addrMaster) << std::endl;
+
+                        break;
+                    }
+
+                    case CLIENT_UPLOAD: {
+                        std::cout << "==> HL: " << "Client sent file with name: '" << packet.fileName << "' and size = " << packet.binary.size() << std::endl;
+
+                        // Write file
+                        writeFile(packet.fileName, packet.binary);
+
+                        // Send ACK back to Master
+                        Packet::compose_CLIENT_REQUEST_ACK(REQUEST::UPLOAD, packet.fileName);
 
                         break;
                     }
@@ -142,7 +162,7 @@ public:
     std::vector<std::string> files;
 
     int numNonRespHeartBeat;
-    int numAvaiSlots;
+    int numAvaiSlots = 100;
 
     DataNodeInfo(NODE_TYPE typeNode, socket_address addr): typeNode(typeNode), addr(addr) {}
 };
@@ -152,6 +172,14 @@ class FileInfo
 public:
     std::string name;
     std::vector<DataNodeInfo *> nodesData;
+
+    FileInfo(DataNodeInfo *node){
+        nodesData.push_back(node);
+    }
+
+    void addDataNode(DataNodeInfo *node){
+        nodesData.push_back(node);
+    }
 };
 
 class MasterNode : public DataNode
@@ -160,12 +188,13 @@ public:
     int durationHeartbeat;
 
     std::map<std::string, DataNodeInfo> infoDataNodes;
-    bool isDataNodeAvailable = false;
+    bool isInfoDataNodeAvailable = false;
     std::mutex mutexInfoDataNode;
 
+    std::map<std::string, FileInfo> infoFiles;
 
-    MasterNode(socket_address dns_address_, in_port_t port, int durationHeartbeat):
-    DataNode(dns_address_, port), durationHeartbeat(durationHeartbeat)
+    MasterNode(socket_address dns_address_, in_port_t port_, int durationHeartbeat_):
+    DataNode(dns_address_, port_), durationHeartbeat(durationHeartbeat_)
     {}
 
     std::string convAddr2Str(socket_address &addr){
@@ -179,12 +208,30 @@ public:
         std::thread miscThread(&MasterNode::doMiscTasks, this);
         std::thread listenThread(&MasterNode::listen, this);
         std::thread consumeThread(&MasterNode::consume, this);
-        std::thread heartbeatThread(&MasterNode::sendHeartBeat, this);
+        #// FIXME: HoangLe [Nov-27]: Enable this
+        // std::thread heartbeatThread(&MasterNode::sendHeartBeat, this);
 
         miscThread.join();
         listenThread.join();
-        heartbeatThread.join();
+        #// FIXME: HoangLe [Nov-27]: Enable this
+        // heartbeatThread.join();
         consumeThread.join();
+    }
+
+    DataNodeInfo* findBestDataNode(){
+        int bestAvaiSlot = 0;
+        DataNodeInfo *bestDataNode = nullptr;
+
+        for (auto& [key, info]: infoDataNodes) {
+            std::cout << "==> HL: " << "Loop: " << key << std::endl;
+
+            if (bestAvaiSlot < info.numAvaiSlots){
+                bestAvaiSlot = info.numAvaiSlots;
+                bestDataNode = &info;
+            }
+        }
+
+        return bestDataNode;
     }
 
     void consume() {
@@ -204,6 +251,8 @@ public:
                     case HEARTBEAT_ACK: {
                         std::cout << "==> HL: " << "Master receives HEARTBEAT_ACK from Data node at: " << socket_address_to_string(packet.addrSrc) << std::endl;
 
+                        mutexInfoDataNode.lock();
+
                         auto record = infoDataNodes.find(convAddr2Str(packet.addrSrc));
                         if (record != infoDataNodes.end()) {
                             DataNodeInfo& info = record->second;
@@ -211,20 +260,96 @@ public:
                             info.numNonRespHeartBeat--;
                         }
 
+                        isInfoDataNodeAvailable = true;
+                        mutexInfoDataNode.unlock();
+
                         break;
                     }
                     case NOTIFY: {
                         std::cout << "==> HL: " << "Master receives NOTIFY from Data node at: " << socket_address_to_string(packet.addrSrc) << std::endl;
 
-                        mutexInfoDataNode.lock();
                         socket_address addrDataNode = packet.addrSrc;
                         addrDataNode = packet.addrSrc;
                         addrDataNode.port = packet.addrParsed.port;
-
                         infoDataNodes.insert({convAddr2Str(addrDataNode), DataNodeInfo(NODE_TYPE::DATA, addrDataNode)});
 
-                        isDataNodeAvailable = true;
+                        isInfoDataNodeAvailable = true;
                         mutexInfoDataNode.unlock();
+                        break;
+                    }
+
+                    case CLIENT_REQUEST_ACK: {
+                        std::cout << "==> HL: " << "Master receives CLIENT_REQUEST_ACK from Data node at: " << socket_address_to_string(packet.addrSrc) << std::endl;
+                        std::cout << "==> HL: " << "filename: " << packet.fileName << std::endl;
+                        std::cout << "==> HL: " << "request: " << packet.request << std::endl;
+
+                        switch (packet.request)
+                        {
+                            case REQUEST::UPLOAD: {
+                                std::string fileName = packet.fileName;
+                                // TODO: HoangLe [Nov-27]: Trigger replication with file `UPLOAD`
+
+                                break;
+                            }
+
+                            case REQUEST::DOWNLOAD : {
+                                // DO nothing
+                                break;
+                            }
+                            
+                            default:
+                                break;
+                        }
+
+                        break;
+                    }
+
+                    case REQUEST_FROM_CLIENT: {
+                        switch (packet.request)
+                        {
+                            case REQUEST::DOWNLOAD : {
+                                // TODO: HoangLe [Nov-26]: Implement this:
+                                break;
+                            }
+
+                            case REQUEST::UPLOAD: {
+                                socket_address addrClient = packet.addrSrc;
+                                addrClient = packet.addrSrc;
+                                addrClient.port = packet.addrParsed.port;
+
+                                auto info = infoFiles.find(packet.fileName);
+                                if (info == infoFiles.end()) {
+                                    // File not exist, allow write
+
+                                    DataNodeInfo *bestDataNode = findBestDataNode();
+                                    if (bestDataNode == nullptr) {
+                                        // Cannot find suitable Data Node to store file
+
+                                        std::cout << "==> HL: " << "Cannot find suitable Data node" << std::endl;
+
+                                        Packet::compose_RESPONSE_NODE_IP().send(addrClient);
+                                    } else {
+                                        std::cout << "==> HL: " << "Found suitable Data node: " << socket_address_to_string(bestDataNode->addr) << std::endl;
+
+                                        // Found suitable Data node, insert new entry
+                                        infoFiles.insert({packet.fileName, FileInfo(bestDataNode)});
+
+                                        Packet::compose_RESPONSE_NODE_IP(bestDataNode->addr).send(addrClient);
+                                    }
+
+                                } else {
+                                    // File exists -> refuse
+                                    std::cout << "==> HL: " << "File existed: '" << packet.fileName << "'" << std::endl;
+                                    Packet::compose_RESPONSE_NODE_IP().send(addrClient);
+                                }
+
+                                break;
+                            }
+
+                            default:
+                                break;
+                        }
+
                         break;
                     }
                 }
@@ -252,7 +377,7 @@ public:
 
             mutexInfoDataNode.lock();
 
-            if (isDataNodeAvailable == true) {
+            if (isInfoDataNodeAvailable == true) {
                 Packet packetHeartbeat = Packet::compose_HEARTBEAT();
 
                 for (auto& [key, info]: infoDataNodes) {
@@ -312,6 +437,9 @@ public:
                 case ASK_IP: {
                     Packet packetReply =  Packet::compose_ASK_IP_ACK(addrCurMaster);
                     packet.addrSrc.port = packet.addrParsed.port;
+
+                    std::cout << "==> HL: " << "Reply IP: " << socket_address_to_string(packet.addrSrc) << std::endl;
+
                     packetReply.send(packet.addrSrc);
 
                     break;
@@ -324,11 +452,116 @@ public:
 
 // ================================================================
 
-class Client
+class Client : public DataNode
 {
 public:
-    Client(/* args */);
-    ~Client();
+    socket_address addrData;
+    std::mutex mutexAddrData;
+    bool isAddrDataReady = false;
+
+    Client(socket_address dns_address, in_port_t port):
+    DataNode(dns_address, port)
+    {}
+
+    void consume() {
+        while (true)
+        {
+            std::unique_lock<std::mutex> lock(mutexPackets);
+            cv.wait(lock, [this] { return isPacketsReady; });
+
+            while (packets.size() > 0)
+            {
+                Packet packet = packets.front();
+                packets.pop();
+
+                switch (packet.packetID)
+                {
+                    case ASK_IP_ACK: {
+                        std::lock_guard<std::mutex> lockGuard(mutexAddrMaster);
+
+                        addrMaster = packet.addrParsed;
+                        isAddrMasterReady = true;
+                        cv.notify_one();
+
+                        std::cout << "==> HL: " << "DNS replies the current Master node address: " << socket_address_to_string(addrMaster) << std::endl;
+
+                        break;
+                    }
+
+                    case RESPONSE_NODE_IP: {
+                        std::lock_guard<std::mutex> lockGuard(mutexAddrData);
+
+                        addrData = packet.addrParsed;
+                        isAddrDataReady = true;
+                        cv.notify_one();
+
+                        std::cout << "==> HL: " << "Master replies the Data node address: " << socket_address_to_string(addrData) << std::endl;
+
+                        break;
+                    }
+                }
+            }
+            
+            isPacketsReady = false;
+        }
+    }
+
+    void uploadFile(std::string nameFile) {
+        std::thread listenThread(&Client::listen, this);
+        std::thread consumeThread(&Client::consume, this);
+
+        // 0. Read binary
+        std::ifstream rf(nameFile, std::ios::in | std::ios::binary);
+        throw_if(!rf, "Err: Cannot open file: " + nameFile);
+        
+        std::vector<u8> binary((std::istreambuf_iterator<char>(rf)), (std::istreambuf_iterator<char>()));
+        rf.close();
+
+        // 1. Connect to DNS to get current Master's ip and port
+        Packet packetDNSAskMaster = Packet::compose_ASK_IP(port);
+        packetDNSAskMaster.send(dns_address);
+
+        // 2. Connect to current Master
+        std::unique_lock<std::mutex> lock(mutexAddrMaster);
+        cv.wait(lock, [this] { return isAddrMasterReady; });
+        
+        Packet packetAskFile = Packet::compose_ASK_READ_WRITE(REQUEST::UPLOAD, nameFile, port);
+        packetAskFile.send(addrMaster);
+    
+        // 3. Connect to assigned Data node
+        std::unique_lock<std::mutex> lock2(mutexAddrData);
+        cv.wait(lock2, [this] { return isAddrDataReady; });
+
+        if (addrData.port == 0) {
+            std::cout << "==> HL: " << "No Data node available to upload file. Terminating..." << std::endl;
+            std::exit(0);
+        } else {    
+            std::cout << "==> HL: " << "Found suitable Data node available to upload file" << std::endl;
+
+            Packet packetBinary = Packet::compose_CLIENT_UPLOAD(nameFile, binary);
+            packetBinary.send(addrData);
+
+            std::exit(0);
+        }
+
+        listenThread.join();
+        consumeThread.join();
+    }
+
+    void downloadFile(std::string name){
+        // 1. Connect to DNS to get current Master's ip and port
+        Packet packetDNSAskMaster = Packet::compose_ASK_IP(port);
+        packetDNSAskMaster.send(dns_address);
+
+        // 2. Connect to current Master to ask the Data node holding file
+        // Packet packetAskFile
+        // TODO: HoangLe [Nov-26]: Implement this to ask to get file
+
+        // 3. Connect to assigned Data node
+        // TODO: HoangLe [Nov-26]: Implement this to ask to get file
+    }
+
 };
+
 
 }//namespace distribsys
