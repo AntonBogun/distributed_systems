@@ -208,7 +208,7 @@ public:
 class MasterNode : public DataNode
 {
 public:
-    int durationHeartbeat;
+    double durationHeartbeat;
 
     std::map<std::string, DataNodeInfo> infoDataNodes;
     bool isInfoDataNodeAvailable = false;
@@ -216,7 +216,7 @@ public:
 
     std::map<std::string, FileInfo> infoFiles;
 
-    MasterNode(socket_address dns_address_, in_port_t port_, int durationHeartbeat_):
+    MasterNode(socket_address dns_address_, in_port_t port_, double durationHeartbeat_):
     DataNode(dns_address_, port_), durationHeartbeat(durationHeartbeat_)
     {}
 
@@ -410,7 +410,7 @@ public:
     void sendHeartBeat() {
         while (true)
         {
-            std::this_thread::sleep_for(std::chrono::seconds(durationHeartbeat));
+            std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int>(durationHeartbeat * 1000000)));
 
             std::cout << "==> HL: " << "Start sending heartbeat!" << std::endl;
 

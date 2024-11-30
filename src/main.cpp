@@ -3,6 +3,7 @@
 #include "utils.h"
 #include "nodes.h"
 #include "packets.h"
+#include "logging.h"
 
 #include <algorithm>
 #include <chrono>
@@ -265,60 +266,68 @@ int test()
     return 0;
 }
 
+constexpr int error_exit_code = -1;
+int cerr_and_return(const std::string msg, int exit_code=error_exit_code) {
+    std::cerr << msg << std::endl;
+    return exit_code;
+}
 
 int main(int argc, char *argv[])
 {
-    // Parse argument
-    std::string mode;
-    in_port_t port;
-    std::string nameFile;
+    // Parse arguments
+    int i = 1;
+    std::string mode="";
+    in_port_t port=0;
+    std::string nameFile = "";
     std::string action = "";
 
-    switch (argc)
-    {
-        case 3: {
-            mode = argv[2];
-            
-            if (mode == "data" || mode == "master") {
-                std::cout << "Mode 'data' or 'master' require port specified" << std::endl;
-                std::cout << "Usage: ./main -mode <client|data|master|dns> -p <port_num> [--path monument.jpg]" << std::endl;
-                std::exit(-1);
+    std::unordered_set<std::string> valid_modes = {"client", "data", "master", "dns"};
+
+    auto display_help = [&](){
+        printcout("Usage: ./main -mode <data|master|dns> -p <port_num>");
+        printcout("Usage: ./main -mode client -p <port_num> [--download monument.jpg | --upload monument.jpg]");
+    };
+    if(argc==1) {
+        display_help();
+        return 0;
+    }
+    while (i < argc) {
+        std::string s(argv[i++]);
+        if(s=="-h" || s=="--help") {
+            display_help();
+            return 0;
+        } else if (s == "-mode") {
+            if(i>=argc) return cerr_and_return("Err: missing argument for -mode");
+            if(mode!="") return cerr_and_return("Err: duplicate mode input: " + mode);
+            mode = argv[i++];
+            if(valid_modes.find(mode)==valid_modes.end()) return cerr_and_return("Err: invalid mode: " + mode);
+        }else if (s == "-p") {
+            if(i>=argc) return cerr_and_return("Err: missing argument for -p");
+            try {
+                if(port!=0) return cerr_and_return("Err: duplicate port input: " + std::string(argv[i-1]));
+                port = static_cast<in_port_t>(std::stoi(argv[i++]));
+                if(port==0) return cerr_and_return("Err: port 0 unsupported");
+            } catch (const std::exception& e) {
+                return cerr_and_return("Err: invalid port number: " + std::string(argv[i-1]));
             }
-            break;
+        }else if (s == "--download" || s == "--upload") {
+            if(action != "") return cerr_and_return("Err: duplicate action: " + s);
+            action = s.substr(2);
+            if(i>=argc) return cerr_and_return("Err: missing argument for " + s);
+            nameFile = argv[i++];
+        }else {
+            return cerr_and_return("Err: invalid argument: " + s);
         }
-        case 5: {
-            mode = argv[2];
-            port = static_cast<in_port_t>(std::stoi(argv[4]));
-            break;
+    }
+    if(port==0) return cerr_and_return("Err: missing port number");
+    if(mode=="client"){
+        if(action=="") return cerr_and_return("Err: client mode requires --download or --upload");
+        if(nameFile=="") return cerr_and_return("Err: client mode requires file path");
+        if(action=="upload" && !ThrowingIfstream::check_file_exists(nameFile)){
+            return cerr_and_return("Err: upload file not found: " + nameFile);
         }
-
-        case 7: {
-            mode = argv[2];
-
-            if (mode != "client") {
-                std::cout << "Usage: ./main -mode <client|data|master|dns> -p <port_num> [--download monument.jpg | --upload monument.jpg]" << std::endl;
-                std::exit(-1);
-            }
-
-            port = static_cast<in_port_t>(std::stoi(argv[4]));
-            nameFile = argv[6];
-
-            if (std::strcmp(argv[5], "--upload") == 0) {
-                action = "upload";
-            } else if (std::strcmp(argv[5], "--download") == 0) {
-                action = "download";
-            } else {
-                std::cout << "Err: Action should be either --download or --upload" << std::endl;
-                std::cout << "Usage: ./main -mode <client|data|master|dns> [-p <port>] [--download monument.jpg | --upload monument.jpg]" << std::endl;
-                return 1;
-            }
-
-            break;
-        }
-        
-        default: {
-            std::cout << "Usage: ./main -mode <client|data|master|dns> [-p <port>] [--download monument.jpg | --upload monument.jpg]" << std::endl;
-            return -1;
+        if(action=="download" && !ThrowingOfstream::check_path_valid(nameFile)){
+            return cerr_and_return("Err: invalid download path: " + nameFile);
         }
     }
 
@@ -332,11 +341,11 @@ int main(int argc, char *argv[])
     socket_address dnsAddress(ip, DNS_PORT);
 
 
-    constexpr int DURATION_HEARBEAT = 2;     // in seconds;
+    constexpr double DURATION_HEARBEAT = 2;     // in seconds;
 
 
     if (mode == "client") {
-        std::cout << "==> HL: " << "Enter client mode." << std::endl;
+        norm_log("Enter client mode.");
 
         Client client(dnsAddress, port);
 
@@ -344,33 +353,27 @@ int main(int argc, char *argv[])
             client.uploadFile(nameFile);
         } else if (action == "download") {
             client.downloadFile(nameFile);
-        } else {
-            std::cout << "NotImplemented!" << std::endl;
         }
     } else if (mode == "master")
     {
-        std::cout << "==> HL: " << "Enter master mode." << std::endl;
+        norm_log("Enter master mode.");
 
         MasterNode master(dnsAddress, port, DURATION_HEARBEAT);
         master.start();
 
     } else if (mode == "data")
     {
-        std::cout << "==> HL: " << "Enter Data mode." << std::endl;
+        norm_log("Enter Data mode.");
 
         DataNode data(dnsAddress, port);
         data.start();
 
     } else if (mode == "dns")
     {
-        std::cout << "==> HL: " << "Enter DNS mode." << std::endl;
+        norm_log("Enter DNS mode.");
 
         DNS dns;
         dns.start();
-
-    } else {
-        std::cout << "Err: invalid arg 'mode'" << std::endl;
-        return -1;
     }
     
     return 0;
