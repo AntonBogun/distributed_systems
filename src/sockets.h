@@ -142,8 +142,8 @@ public:
     //~ does not throw, simply is_valid() will return false
     //~ does not check for valid fd
     file_descriptor accept_connection(socket_address& addr) const {
-        socklen_t len = sizeof(addr);
         struct sockaddr_in client_address;
+        socklen_t len = sizeof(client_address);
         int new_fd = accept(fd, (struct sockaddr *)&client_address, &len);
         addr = socket_address::from_sockaddr_in(client_address);
         return file_descriptor(new_fd);
