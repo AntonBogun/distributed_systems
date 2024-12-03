@@ -3,6 +3,7 @@
 #include <atomic>
 namespace distribsys{
     extern std::atomic<bool> _do_logging; //defined in main.cpp
+    extern std::atomic<bool> _do_verbose; //defined in main.cpp
     extern std::mutex _mutex_logging;
     void set_logging(bool do_logging){
         std::lock_guard<std::mutex> lock(_mutex_logging);
@@ -18,6 +19,9 @@ namespace distribsys{
         log(prefix + msg);
     }
     void norm_log(const std::string &msg){
+        prefix_log("==> HL: ", msg);
+    }
+    void verbose_log(const std::string &msg){
         prefix_log("==> HL: ", msg);
     }
 

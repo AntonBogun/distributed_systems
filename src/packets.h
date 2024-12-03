@@ -15,21 +15,18 @@ inline void convBytesToUInt16(uint8_t *src, uint16_t *dst) {memcpy(dst, src, 2);
 
 enum PACKET_ID : u8
 {
-    HEARTBEAT=0,
-    HEARTBEAT_ACK=1,
-    REQUEST_SEND_REPLICA=2,
-    SEND_REPLICA=3,
-    SEND_REPLICA_ACK=4,
-    ASK_IP=5,
-    ASK_IP_ACK=6,
-    REQUEST_FROM_CLIENT=7,
-    RESPONSE_NODE_IP=8,
-    CLIENT_UPLOAD=9,
-    DATANODE_SEND_DATA=10,
-    CLIENT_REQUEST_ACK=11,
-    STATE_SYNC=12,
-    STATE_SYNC_ACK=13,
-    NOTIFY=14,
+    REQUEST_OPEN_HEARTBEAT_CONNECTION=0, // master -> data nodes
+    REQUEST_MASTER_ADDRESS=1,            // client -> dns
+    SET_MASTER_ADDRESS=2,                // master -> both dns and data nodes
+    REQUEST_LIST_OF_ALL_NODES=3,         // master -> dns
+    EDIT_LIST_OF_ALL_NODES=4,            // master -> dns
+    SET_DATA_NODE_AS_BACKUP=5,           // master -> data node
+    CLIENT_CONNECTION_REQUEST=6,         // client -> both to master and data nodes
+    DATA_NODE_TO_MASTER_CONNECTION_REQUEST=7, // data node -> master
+    MASTER_NODE_TO_DATA_NODE_REPLICATION_REQUEST=8, // master -> data node
+    DATA_NODE_TO_DATA_NODE_CONNECTION_REQUEST=9, // data node -> data node
+    MASTER_TO_DATA_NODE_INFO_REQUEST=10,  // master -> data node
+    MASTER_TO_DATA_NODE_PAUSE_CHANGE=11   // master -> data node
 };
 
 
@@ -39,11 +36,6 @@ enum REQUEST : u8
     UPLOAD
 };
 
-enum NODE_TYPE : u8
-{
-    MASTER,
-    DATA
-};
 
 constexpr u8 BYTE_SEP_CHARACTER = 124;      // byte value of character '|'
 

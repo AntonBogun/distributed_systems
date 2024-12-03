@@ -1,7 +1,7 @@
 #pragma once
 #include "sockets.h"
 #include "utils.h"
-
+#include "logging.h"
 
 #include <algorithm>
 #include <cstring>
@@ -17,6 +17,7 @@
 namespace distribsys{
 
 
+//client or server
 enum SOCKET_TYPE
 {
     CLIENT,
@@ -29,7 +30,8 @@ enum class error_code
     MAX_BATCH_SEND_TIME = 1,
     MAX_BATCH_RECEIVE_TIME = 2,
     TOO_LOW_THROUGHPUT = 3,
-    SOCKET_ERROR = 4 //+ errno set
+    SOCKET_ERROR = 4, //+ errno set
+    CONNECTION_CLOSED = 5
 };
 
 
@@ -40,6 +42,7 @@ constexpr int MAX_MESSAGE_SIZE = 4096;
 constexpr int TRANSMISSION_LAYER_HEADER = sizeof(int) + sizeof(bool); // datalen + batches_continue
 constexpr int MAX_DATA_SIZE = MAX_MESSAGE_SIZE - TRANSMISSION_LAYER_HEADER;
 
+//0
 const TimeValue NO_DELAY{0.0};
 
 #define DEBUG_PRINTS 0
@@ -77,14 +80,23 @@ static_assert(sizeof(int) == sizeof(i32), "int and i32 must be the same size");
 class OpenSocket
 {
 public:
-    bool valid = false;
 
     FCVector<char> in_buffer;
     FCVector<char> out_buffer;
 
-    int allocated_fd; // file descriptor associated with socket
+    file_descriptor allocated_fd; // file descriptor associated with socket
     socket_address other_address;
     SOCKET_TYPE sock_type;
+    bool throw_on_recoverable=false;
+    bool is_valid() const { return allocated_fd.is_valid(); }
+#define THROW_IF_RECOVERABLE(x,s)\
+if(x){\
+    if(throw_on_recoverable){\
+        throw std::runtime_error(s);\
+    }else{\
+        return true;\
+    }\
+}
 
     i64 num_send = 0;
     i64 num_recv = 0;
@@ -100,21 +112,20 @@ public:
     }
     //% return true if timeout
     [[nodiscard]]
-    bool accept_connection(in_port_t server_fd, TimeValue timeout = NO_DELAY)
+    bool accept_connection(const file_descriptor& server_fd, TimeValue timeout = NO_DELAY)
     { // server file descriptor
         throw_if(sock_type != SERVER, "Cannot accept connection on client socket");
-        throw_if(valid, "Cannot accept, socket already valid");
+        throw_if(is_valid(), "Cannot accept, socket already valid");
 
         set_timeout_throw(server_fd, timeout);
 
-        struct sockaddr_in client_address;    // overwritten by accept
-        int addrlen = sizeof(client_address); // overwritten by accept
         TimeValue start = TimeValue::now();
         while(true){//wait for connection
-            allocated_fd = accept(server_fd, (struct sockaddr *)&client_address, (socklen_t *)&addrlen);
-            if(allocated_fd<0){
+            // allocated_fd = accept(server_fd, (struct sockaddr *)&client_address, (socklen_t *)&addrlen);
+            allocated_fd = server_fd.accept_connection(other_address);
+            if(!allocated_fd.is_valid()){
                 if(errno==EINTR||errno==EAGAIN||errno==EWOULDBLOCK){
-                    if(!timeout.is_near(0) && TimeValue::now()-start>timeout){
+                    if(!timeout.is_near(NO_DELAY) && TimeValue::now()-start>timeout){
                         return true;
                     }else{
                         continue;
@@ -124,26 +135,24 @@ public:
                 }
             } else {break;}
         }
-        throw_if(allocated_fd < 0,
+        THROW_IF_RECOVERABLE(!allocated_fd.is_valid(),
                  prints_new("Failed to accept connection, errno:", errno));
-
-        other_address = socket_address::from_sockaddr_in(client_address);
 
         socket_address client_fd_address = socket_address::from_fd_remote(allocated_fd);
 
         throw_if(client_fd_address != other_address,
                  prints_new("Accept address mismatch: ", socket_address_to_string(client_fd_address), " != ", socket_address_to_string(other_address)));
 
-        MUTEX_PRINT(prints_new("Accepted connection from client: ", socket_address_to_string(other_address),
+        verbose_log(prints_new("Accepted connection from client: ", socket_address_to_string(other_address),
                                " to server: ", socket_address_to_string(socket_address::from_fd_local(allocated_fd))));
-        valid = true;
         return false;
     }
+    //% return true if timeout
     [[nodiscard]]
     bool connect_to_server(socket_address address, TimeValue timeout = NO_DELAY)
     {
         throw_if(sock_type != CLIENT, "Cannot connect to server on server socket");
-        throw_if(valid, "Cannot connect, socket already valid");
+        throw_if(is_valid(), "Cannot connect, socket already valid");
 
         // create new file descriptor and then connect binds it to free port
         allocated_fd = create_socket_throw();
@@ -151,15 +160,13 @@ public:
         set_socket_options_throw(allocated_fd);
         set_timeout_throw(allocated_fd, timeout);
 
-        struct sockaddr_in server_address = address.to_sockaddr_in();
-
-        int res;
+        bool success;
         TimeValue start = TimeValue::now();
         while(true){//wait for connection
-            res = connect(allocated_fd, (struct sockaddr *)&server_address, sizeof(server_address));
-            if(res<0){
+            success = allocated_fd.connect_to_server(address);
+            if(!success){
                 if(errno==EINTR||errno==EAGAIN||errno==EWOULDBLOCK){
-                    if(!timeout.is_near(0) && TimeValue::now()-start>timeout){
+                    if(!timeout.is_near(NO_DELAY) && TimeValue::now()-start>timeout){
                         return true;
                     }else{
                         continue;
@@ -169,7 +176,7 @@ public:
                 }
             } else {break;}
         }
-        throw_if(res < 0, prints_new("Failed to connect to server, errno:", errno));
+        THROW_IF_RECOVERABLE(!success, prints_new("Failed to connect to server, errno:", errno));
 
         other_address = address;
 
@@ -178,29 +185,23 @@ public:
         throw_if(server_fd_address != other_address,
                  prints_new("Connect address mismatch: ", socket_address_to_string(server_fd_address), " != ", socket_address_to_string(other_address)));
 
-        MUTEX_PRINT(prints_new("Connected to server: ", socket_address_to_string(other_address),
+        verbose_log(prints_new("Connected to server: ", socket_address_to_string(other_address),
                                " from client: ", socket_address_to_string(socket_address::from_fd_local(allocated_fd))));
-        valid = true;
         return false;
     }
     [[nodiscard]]
-    ssize_t Send(int fd, const void *buf, size_t len, int flags)
+    ssize_t Send(const void *buf, size_t len, int flags)
     {
         num_send++;
-        return ::send(fd, buf, len, flags);
+        // return ::send(fd, buf, len, flags);
+        return allocated_fd.Send(buf, len, flags);
     }
     [[nodiscard]]
-    ssize_t Recv(int fd, void *buf, size_t len, int flags)
+    ssize_t Recv(void *buf, size_t len, int flags)
     {
         num_recv++;
-        return ::recv(fd, buf, len, flags);
-    }
-    ~OpenSocket()
-    {
-        if (valid)
-        {
-            close(allocated_fd);
-        }
+        // return ::recv(fd, buf, len, flags);
+        return allocated_fd.Recv(buf, len, flags);
     }
 };
 
@@ -236,12 +237,12 @@ class TransmissionLayer{
     i64 batches_received = 0;
 
     //% assumes all of these non-zero
-    TimeValue since_last_non0_timeout = 5;//timeout after this many seconds of no data
-    TimeValue max_batch_send_time = 20;//timeout after this many seconds of sending one batch
-    TimeValue max_batch_receive_time = 25;//timeout after this many seconds of receiving one batch
+    TimeValue since_last_non0_timeout = 1;//timeout after this many seconds of no data
+    TimeValue max_batch_send_time = 2;//timeout after this many seconds of sending one batch
+    TimeValue max_batch_receive_time = 2;//timeout after this many seconds of receiving one batch
     double min_data_throughput_limit = 4000;//bytes per second
-    i32 min_data_throughput_batch_size = 2000;//bytes, how large a batch should be to be considered for throughput limit
-    double last_batches = 30;//how many batches until we start checking for throughput limit
+    i32 min_data_throughput_batch_size = 1000;//bytes, how large a batch should be to be considered for throughput limit
+    double last_batches = 10;//how many batches until we start checking for throughput limit
 
     std::queue<std::pair<TimeValue,i32>> batch_send_info;
     std::pair<TimeValue,i64> batch_send_info_cumulative = {0,0};
@@ -307,7 +308,7 @@ class TransmissionLayer{
 
     TransmissionLayer(OpenSocket& sock_):
         sock(sock_){
-            throw_if(!sock.valid, "Socket not valid on TransmissionLayer creation");
+            throw_if(!sock.is_valid(), "Socket not valid on TransmissionLayer creation");
         }
 
     inline char* out_buf_at(int offset){
@@ -340,7 +341,7 @@ class TransmissionLayer{
     //% true if error
     [[nodiscard]]
     bool construct_and_send(bool batches_continue){
-        throw_if(!sock.valid, "Socket not valid on construct_and_send");
+        throw_if(!sock.is_valid(), "Socket not valid on construct_and_send");
         const int data_len = total_written-TRANSMISSION_LAYER_HEADER;
 
         throw_if(batches_continue&&data_len!=MAX_DATA_SIZE, 
@@ -380,7 +381,7 @@ class TransmissionLayer{
                 last_error = error_code::SOCKET_ERROR;
                 return true;
             }
-            i64 valsend = sock.Send(sock.allocated_fd, out_buf_at(total_sent), to_send, 0);
+            i64 valsend = sock.Send(out_buf_at(total_sent), to_send, 0);
             if(valsend<0){
                 if(errno==EINTR) continue; //interrupted, retry
                 if(errno==EAGAIN||errno==EWOULDBLOCK) continue; //timeout, retry
@@ -493,14 +494,18 @@ class TransmissionLayer{
                 last_error = error_code::SOCKET_ERROR;
                 return true;
             }
-            i64 valrecv = sock.Recv(sock.allocated_fd, in_buf_at(total_received), to_recv, 0);
+            i64 valrecv = sock.Recv(in_buf_at(total_received), to_recv, 0);
             if(valrecv<0){
                 if(errno==EINTR) continue; //interrupted, retry
                 if(errno==EAGAIN||errno==EWOULDBLOCK) continue; //timeout, retry
                 last_error = error_code::SOCKET_ERROR;
                 return true;
             }
-            throw_if(valrecv == 0, "Unexpected valrecv == 0 on recv_n");//~should never happen
+            // throw_if(valrecv == 0, "Unexpected valrecv == 0 on recv_n");//~should never happen
+            else if (valrecv == 0){
+                last_error = error_code::CONNECTION_CLOSED;
+                return true;
+            }
             total_received += valrecv;
             to_recv -= valrecv;
         }
@@ -514,7 +519,7 @@ class TransmissionLayer{
     //% true if error
     [[nodiscard]]
     bool recv_new_batch(){
-        throw_if(!sock.valid, "Socket not valid on recv_new_batch");
+        throw_if(!sock.is_valid(), "Socket not valid on recv_new_batch");
         TimeValue start=TimeValue::now();
         total_received = 0;//reset total_received
         if(recv_n(TRANSMISSION_LAYER_HEADER)){
@@ -584,23 +589,23 @@ class TransmissionLayer{
         double throughput;
         switch(last_error){
             case error_code::NO_ERROR:
-                MUTEX_PRINT("No error");
+                norm_log("No error");
                 break;
             case error_code::MAX_BATCH_SEND_TIME:
-                MUTEX_PRINT("Max batch send time exceeded");
+                norm_log("Max batch send time exceeded");
                 break;
             case error_code::MAX_BATCH_RECEIVE_TIME:
-                MUTEX_PRINT("Max batch receive time exceeded");
+                norm_log("Max batch receive time exceeded");
                 break;
             case error_code::TOO_LOW_THROUGHPUT:
                 throughput = get_throughput();
-                MUTEX_PRINT("Too low throughput: "+std::to_string(throughput)+" bytes per second");
+                norm_log("Too low throughput: "+std::to_string(throughput)+" bytes per second");
                 break;
             case error_code::SOCKET_ERROR:
-                MUTEX_PRINT("Socket error: errno="+std::to_string(static_cast<int>(errno)));
+                norm_log("Socket error: errno="+std::to_string(static_cast<int>(errno)));
                 break;
             default:
-                MUTEX_PRINT("Unknown error: errno="+std::to_string(static_cast<int>(errno)));
+                norm_log("Unknown error: errno="+std::to_string(static_cast<int>(errno)));
                 break;
         }
     }

@@ -38,11 +38,13 @@ struct ipv4_addr
         ip.d = (addr.s_addr >> 24) & 0xFF;
         return ip;
     }
-    struct in_addr to_in_addr()
-    {
+    struct in_addr to_in_addr() const{
         struct in_addr addr;
         addr.s_addr = a | (b << 8) | (c << 16) | (d << 24);
         return addr;
+    }
+    u32 to_u32() const {
+        return a | (b << 8) | (c << 16) | (d << 24);
     }
     bool operator==(ipv4_addr other) const
     {
@@ -53,6 +55,7 @@ struct ipv4_addr
         return !(*this == other);
     }
 };
+
 
 std::string ip_to_string(ipv4_addr ip)
 {
@@ -80,18 +83,18 @@ struct socket_address
         saddr.port = ntohs(addr.sin_port);
         return saddr;
     }
-    static socket_address from_fd_local(int fd)
+    static socket_address from_fd_local(const file_descriptor& fd)
     {
         struct sockaddr_in addr;
         socklen_t len = sizeof(addr);
-        getsockname(fd, (struct sockaddr *)&addr, &len);
+        getsockname(fd.get_fd(), (struct sockaddr *)&addr, &len);
         return from_sockaddr_in(addr);
     }
-    static socket_address from_fd_remote(int fd)
+    static socket_address from_fd_remote(const file_descriptor& fd)
     {
         struct sockaddr_in addr;
         socklen_t len = sizeof(addr);
-        getpeername(fd, (struct sockaddr *)&addr, &len);
+        getpeername(fd.get_fd(), (struct sockaddr *)&addr, &len);
         return from_sockaddr_in(addr);
     }
     struct sockaddr_in to_sockaddr_in()
@@ -109,6 +112,70 @@ struct socket_address
     bool operator!=(socket_address other) const
     {
         return !(*this == other);
+    }
+};
+struct file_descriptor{
+    int fd=-1;
+public:
+    bool is_valid() const {
+        return fd>=0;
+    }
+    void close_fd(){
+        if(is_valid()){
+            ::close(fd);
+            fd=-1;
+        }
+    }
+    int get_fd() const {
+        return fd;
+    }
+    file_descriptor(){}
+    explicit file_descriptor(int fd_):fd(fd_){}
+    file_descriptor(file_descriptor&& other){
+        fd=other.fd;
+        other.fd=-1;
+    }
+
+    file_descriptor& operator=(file_descriptor&& other){
+        if(this==&other) return *this;
+        if(fd!=other.fd){
+            close_fd();
+            fd=other.fd;
+        }
+        other.fd=-1;
+        return *this;
+    }
+    file_descriptor& operator=(int fd_){
+        if(fd==fd_) return *this;
+        close_fd();
+        fd=fd_;
+        return *this;
+    }
+
+    //~ does not throw, simply is_valid() will return false
+    //~ does not check for valid fd
+    file_descriptor accept_connection(socket_address& addr) const {
+        socklen_t len = sizeof(addr);
+        struct sockaddr_in client_address;
+        int new_fd = accept(fd, (struct sockaddr *)&client_address, &len);
+        addr = socket_address::from_sockaddr_in(client_address);
+        return file_descriptor(new_fd);
+    }
+    //! false on failure
+    bool connect_to_server(socket_address addr) const {
+        struct sockaddr_in server_address = addr.to_sockaddr_in();
+        int res = connect(fd, (struct sockaddr *)&server_address, sizeof(server_address));
+        return res>=0;
+    }
+    ssize_t Send(const void *buf, size_t len, int flags) const {
+        return send(fd, buf, len, flags);
+    }
+    ssize_t Recv(void *buf, size_t len, int flags) const {
+        return recv(fd, buf, len, flags);
+    }
+
+    ~file_descriptor(){
+        close_fd();
     }
 };
 std::string socket_address_to_string(socket_address addr)
@@ -156,12 +223,12 @@ struct TimeValue
         gettimeofday(&tv, nullptr);
         return TimeValue{tv};
     }
-    double to_double()
+    double to_double() const
     {
         return time;
     }
     //** undefined when negative
-    struct timeval to_timeval()
+    struct timeval to_timeval() const
     {
         throw_if(time < 0, "TimeValue to_timeval: negative time");
         struct timeval tv;
@@ -169,7 +236,7 @@ struct TimeValue
         tv.tv_usec = static_cast<suseconds_t>((time - static_cast<double>(tv.tv_sec)) * 1e6);
         return tv;
     }
-    std::string to_duration_string()
+    std::string to_duration_string() const
     {
         std::stringstream ss;
         // at most 6 decimal places
@@ -177,7 +244,7 @@ struct TimeValue
         return ss.str();
     }
     //** undefined when negative
-    std::string to_date_string()
+    std::string to_date_string() const
     {
         struct tm *tm_info;
         char buffer[30];
@@ -231,38 +298,40 @@ struct TimeValue
         return time >= other.time;
     }
     // do not compare floating point numbers for equality
-    // bool operator==(TimeValue other){
-    //     return time==other.time;
-    // }
-    bool is_near(TimeValue other, double epsilon = 1e-6)
+    //this instead checks if the difference is less than epsilon (by default 1e-6)
+    bool is_near(TimeValue other, double epsilon = 1e-6) const
     {
         return std::abs(time - other.time) < epsilon;
     }
+    // bool operator==(TimeValue other){
+    //     return time==other.time;
+    // }
+    
 };
 extern const TimeValue NO_DELAY;
 
-int create_socket_throw()
+file_descriptor create_socket_throw()
 {
     int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     throw_if(socket_fd < 0, prints_new("Failed to create socket, errno:", errno));
-    return socket_fd;
+    return file_descriptor(socket_fd);
 }
-void set_socket_options_throw(int socket_fd)
+void set_socket_options_throw(const file_descriptor& socket_fd)
 {
     int opt = 1;
-    throw_if(setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0,
+    throw_if(setsockopt(socket_fd.get_fd(), SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0,
              prints_new("Failed to set SO_REUSEADDR, errno:", errno));
-    throw_if(setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0,
+    throw_if(setsockopt(socket_fd.get_fd(), SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0,
              prints_new("Failed to set SO_REUSEPORT, errno:", errno));
-    throw_if(setsockopt(socket_fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt)) < 0,
+    throw_if(setsockopt(socket_fd.get_fd(), SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt)) < 0,
              prints_new("Failed to set SO_KEEPALIVE, errno:", errno));
 }
-void set_timeout_throw(int socket_fd, TimeValue timeout)
+void set_timeout_throw(const file_descriptor& socket_fd, TimeValue timeout)
 {
     struct timeval tv = timeout.to_timeval();
-    throw_if(setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0,
+    throw_if(setsockopt(socket_fd.get_fd(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0,
              prints_new("Failed to set SO_RCVTIMEO, errno:", errno));
-    throw_if(setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0,
+    throw_if(setsockopt(socket_fd.get_fd(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0,
              prints_new("Failed to set SO_SNDTIMEO, errno:", errno));
 }
 u64 get_thread_id()
@@ -272,26 +341,26 @@ u64 get_thread_id()
 }
 //% true means error + errno set
 [[nodiscard]]
-bool set_socket_send_timeout(int socket_fd, TimeValue timeout)
+bool set_socket_send_timeout(const file_descriptor& socket_fd, TimeValue timeout)
 {
     struct timeval tv = timeout.to_timeval();
-    return setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0;
+    return setsockopt(socket_fd.get_fd(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0;
 }
 [[nodiscard]]
-bool set_socket_recv_timeout(int socket_fd, TimeValue timeout)
+bool set_socket_recv_timeout(const file_descriptor& socket_fd, TimeValue timeout)
 {
     struct timeval tv = timeout.to_timeval();
-    return setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0;
+    return setsockopt(socket_fd.get_fd(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0;
 }
 
 
 constexpr int BACKLOG = 5;
+//!NOTE: ServerSocket MUST BE ALIVE for the entire duration of usage of the file_descriptor
 class ServerSocket
 {
-    int socket_fd;
+    file_descriptor socket_fd;
 
 public:
-    bool connection_open = false;
     ServerSocket(in_port_t port)
     {
 
@@ -304,7 +373,7 @@ public:
         // server_address.sin_addr.s_addr = htonl(INADDR_ANY);
         // server_address.sin_port = htons(PORT);
         struct sockaddr_in bind_address = socket_address(0, 0, 0, 0, port).to_sockaddr_in(); // 0,0,0,0 to bind to all interfaces
-        throw_if(bind(socket_fd, (struct sockaddr *)&bind_address, sizeof(bind_address)) < 0,
+        throw_if(bind(socket_fd.get_fd(), (struct sockaddr *)&bind_address, sizeof(bind_address)) < 0,
                  prints_new("Failed to bind socket, errno:", errno));
 
         socket_address bound_address = socket_address::from_fd_local(socket_fd);
@@ -314,25 +383,69 @@ public:
 
         printcout(prints_new("Server socket bound to: ", socket_address_to_string(bound_address)));
 
-        throw_if(listen(socket_fd, BACKLOG) < 0,
+        throw_if(listen(socket_fd.get_fd(), BACKLOG) < 0,
                  prints_new("Failed to listen, errno:", errno));
 
         printcout("Listening for connections...");
     }
-
-    int get_socket_fd()
+    //!NOTE: ServerSocket MUST BE ALIVE for the entire duration of usage of the file_descriptor
+    const file_descriptor& get_socket_fd()
     {
         return socket_fd;
     }
-    void close_socket()
+};
+//should actually be a full socket_address for the local, but we dont expect multiple interfaces
+//unused for now
+struct connection_info
+{
+    in_port_t local_port;
+    socket_address external_address;
+    connection_info(in_port_t local_port_, socket_address external_address_) : local_port(local_port_), external_address(external_address_) {}
+    connection_info() : local_port(0), external_address() {}
+
+    bool operator==(connection_info other) const
     {
-        close(socket_fd);
+        return local_port == other.local_port && external_address == other.external_address;
     }
-    ~ServerSocket()
+    bool operator!=(connection_info other) const
     {
-        close_socket();
+        return !(*this == other);
+    }
+    std::string to_string() const
+    {
+        std::stringstream ss;
+        ss << "(port " << local_port << ", external: " << socket_address_to_string(external_address) << ")";
+        return ss.str();
     }
 };
 
 
 }//namespace distribsys
+
+
+namespace std{
+    template<>
+    struct hash<distribsys::ipv4_addr>{
+        std::size_t operator()(const distribsys::ipv4_addr& ip) const noexcept{
+            return std::hash<u32>{}(ip.to_u32());
+        }
+    };
+    template<>
+    struct hash<distribsys::socket_address>{
+        std::size_t operator()(const distribsys::socket_address& addr) const noexcept{
+            return std::hash<u32>{}(addr.ip.to_u32()) ^ std::hash<in_port_t>{}(addr.port);
+        }
+    };
+    template<>
+    struct hash<distribsys::TimeValue>{
+        std::size_t operator()(const distribsys::TimeValue& tv) const noexcept{
+            return std::hash<double>{}(tv.to_double());
+        }
+    };
+    template<>
+    struct hash<distribsys::connection_info>{
+        std::size_t operator()(const distribsys::connection_info& info) const noexcept{
+            return std::hash<in_port_t>{}(info.local_port) ^ std::hash<distribsys::socket_address>{}(info.external_address);
+        }
+    };
+}

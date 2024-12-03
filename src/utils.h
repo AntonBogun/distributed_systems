@@ -543,8 +543,17 @@ class ThrowingOfstream : public std::ofstream {
 
     static bool check_path_valid(const std::string &filepath) {
         // ThrowingOfstream(filepath, std::ios::out);
-        std::ofstream file(filepath);
-        return file.good();
+        // std::ofstream file(filepath);
+        // return file.good();
+        try {
+            ThrowingOfstream(filepath, std::ios::out);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+    static bool check_file_exists(const std::string &filepath) {
+        return std::filesystem::exists(filepath);
     }
 
 
@@ -556,6 +565,32 @@ class ThrowingOfstream : public std::ofstream {
                            "cannot be opened. Check that all the folders in the path is "
                            "correct and that you have permission to create files in this path folder"));
         }
+    }
+    static bool make_recursive_dir(const std::string &dirpath) {
+        return std::filesystem::create_directories(dirpath);
+    }
+    static bool make_recursive_file(const std::string &file) {
+        if(!check_path_valid(file)){
+            return false;
+        }
+        std::filesystem::path p(file);
+        if (p.has_parent_path()) {
+            if(!make_recursive_dir(p.parent_path().string())){
+                return false;
+            }
+        }
+        std::ofstream of(file);
+        return of.good();
+    }
+    static bool remove_file(const std::string &file) {
+        return std::filesystem::remove(file);
+    }
+    static std::vector<std::string> list_files(const std::string &dir) {
+        std::vector<std::string> files;
+        for (const auto &entry : std::filesystem::directory_iterator(dir)) {
+            files.push_back(entry.path().string());
+        }
+        return files;
     }
 
     void write_line(const std::string &s) {

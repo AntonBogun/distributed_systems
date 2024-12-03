@@ -17,6 +17,12 @@
 #include <endian.h>
 static_assert(BYTE_ORDER == LITTLE_ENDIAN, "This code only works on little-endian systems");
 
+namespace distribsys{
+    std::atomic<bool> _do_logging = true;
+    std::atomic<bool> _do_verbose = false;
+    std::mutex _mutex_logging;
+}
+
 using namespace distribsys;
 
 std::string rate_to_string(double rate)
@@ -179,7 +185,7 @@ int test()
     TimeValue tv3 = TimeValue(-0.4);
     printcout(prints_new("Duration: ", tv3.to_duration_string()));
     ServerSocket server_socket(port);
-    int server_fd = server_socket.get_socket_fd();
+    const file_descriptor& server_fd = server_socket.get_socket_fd();
 
     // Create thread for server and client service
     int vector_n = 100000;
@@ -358,14 +364,13 @@ int main(int argc, char *argv[])
     {
         norm_log("Enter master mode.");
 
-        MasterNode master(dnsAddress, port, DURATION_HEARBEAT);
+        DataNode master(dnsAddress, port, node_role::MASTER);
         master.start();
-
     } else if (mode == "data")
     {
         norm_log("Enter Data mode.");
 
-        DataNode data(dnsAddress, port);
+        DataNode data(dnsAddress, port,node_role::DATA);
         data.start();
 
     } else if (mode == "dns")

@@ -21,33 +21,98 @@ class Node{
     socket_address dns_address;
     Node(socket_address dns_address_):dns_address(dns_address_){}
 };
+struct connection_stats{
+    bool is_outgoing;
+    int fd;
+    socket_address other_addr;
+    in_port_t local_port;
+    std::thread& thread;
+};
+#define continue_on_err(x) \
+    {                           \
+        if (x)                  \
+        {                       \
+            continue;           \
+        }                       \
+    }
+
 class Server: public Node
 {
 public:
     ServerSocket server_socket;
+    std::mutex connections_mutex;
+    std::unordered_map<connection_info, connection_stats> connections;
+    Server(socket_address dns_address_, in_port_t port): Node(dns_address_), server_socket(port)
+    {}//server_socket constructor already starts listening
 
-    Server(socket_address dns_address_, in_port_t port): Node(dns_address_), server_socket(port) {}
+    void start() {
+        while (true)
+        {
+            OpenSocket open_socket(SERVER);
+            continue_on_err(open_socket.accept_connection(server_socket.get_socket_fd()));
 
-    void start(){}
+            Packet packet = Packet(open_socket);
+            switch (packet.packetID)
+            {
+                case NOTIFY: {
+                    addrCurMaster = packet.addrSrc;
+                    addrCurMaster.port = packet.addrParsed.port;
+
+                    norm_log("Signed up new Master at: " + socket_address_to_string(addrCurMaster));
+
+                    break;
+                }
+
+                case ASK_IP: {
+                    Packet packetReply =  Packet::compose_ASK_IP_ACK(addrCurMaster);
+                    packet.addrSrc.port = packet.addrParsed.port;
+
+                    norm_log("Reply IP: " + socket_address_to_string(packet.addrSrc));
+
+                    packetReply.send(packet.addrSrc);
+
+                    break;
+                }
+            }
+            
+        }
+    }
 };
+//MASTER/MASTER_BACKUP/DATA
+enum node_role{
+    MASTER,
+    MASTER_BACKUP,
+    DATA
+};
+
+// ================================================================
+
+class DNS : public Server
+{
+public:
+    DNS():Server(socket_address(0,0,0,0,0), DNS_PORT){}
+    socket_address addrCurMaster;
+    std::unordered_set<socket_address> nodes;
+
+};
+// ================================================================
 class DataNode: public Server
 {
 public:
-    in_port_t port;             // the port the node is listenning
+    node_role role;
+    in_port_t port; // the exposed port the node is always listening on
+
+    std::mutex m;
     std::condition_variable cv;
 
-    std::queue<Packet> packets;
-    std::mutex mutexPackets;
-    bool isPacketsReady = false;
-
     socket_address addrMaster;
-    std::mutex mutexAddrMaster;
     bool isAddrMasterReady = false;
 
     std::vector<std::string> files;
+    std::unordered_set<int> used_fds;
 
-    DataNode(socket_address dns_address_, in_port_t port):
-    Server(dns_address_, port), port(port){}
+    DataNode(socket_address dns_address_, in_port_t port, node_role initial_role):
+    Server(dns_address_, port), port(port), role(initial_role){}
 
     void start(){
         std::thread listenThread(&DataNode::listen, this);
@@ -96,7 +161,7 @@ public:
             while (packets.size() > 0)
             {
                 Packet packet = packets.front();
-                // std::cout << "==> HL: " << "Consume packet : " << static_cast<int>(packet.packetID) << std::endl;
+                // norm_log("Consume packet : " + static_cast<int>(packet.packetID));
                 packets.pop();
 
                 switch (packet.packetID)
@@ -115,13 +180,13 @@ public:
                         isAddrMasterReady = true;
                         cv.notify_one();
 
-                        std::cout << "==> HL: " << "DNS replies the current Master node address: " << socket_address_to_string(addrMaster) << std::endl;
+                        norm_log("DNS replies the current Master node address: " + socket_address_to_string(addrMaster));
 
                         break;
                     }
 
                     case CLIENT_UPLOAD: {
-                        std::cout << "==> HL: " << "Client sent file with name: '" << packet.fileName << "' and size = " << packet.binary.size() << std::endl;
+                        norm_log(prints_new("Client sent file with name: '",packet.fileName,"' and size = ",packet.binary.size()));
 
                         // Write file
                         writeFile(packet.fileName, packet.binary);
@@ -171,7 +236,7 @@ public:
 
         Packet packetNotifyMaster = Packet::compose_NOTIFY(NODE_TYPE::DATA, port);
         packetNotifyMaster.send(addrMaster);
-        std::cout << "==> HL: " << "Data sent NOTIFY to Master: " << socket_address_to_string(addrMaster) << std::endl;
+        norm_log("Data sent NOTIFY to Master: " + socket_address_to_string(addrMaster));
     }
 
 };
@@ -244,7 +309,7 @@ public:
         DataNodeInfo *bestDataNode = nullptr;
 
         for (auto& [key, info]: infoDataNodes) {
-            std::cout << "==> HL: " << "Loop: " << key << std::endl;
+            norm_log("Loop: " + key);
 
             if (bestAvaiSlot < info.numAvaiSlots){
                 bestAvaiSlot = info.numAvaiSlots;
@@ -264,13 +329,13 @@ public:
             while (packets.size() > 0)
             {
                 Packet packet = packets.front();
-                std::cout << "==> HL: " << "Consume packet : " << static_cast<int>(packet.packetID) << std::endl;
+                norm_log("Consume packet : " + static_cast<int>(packet.packetID));
                 packets.pop();
 
                 switch (packet.packetID)
                 {
                     case HEARTBEAT_ACK: {
-                        std::cout << "==> HL: " << "Master receives HEARTBEAT_ACK from Data node at: " << socket_address_to_string(packet.addrSrc) << std::endl;
+                        norm_log("Master receives HEARTBEAT_ACK from Data node at: " + socket_address_to_string(packet.addrSrc));
 
                         mutexInfoDataNode.lock();
 
@@ -287,7 +352,7 @@ public:
                         break;
                     }
                     case NOTIFY: {
-                        std::cout << "==> HL: " << "Master receives NOTIFY from Data node at: " << socket_address_to_string(packet.addrSrc) << std::endl;
+                        norm_log("Master receives NOTIFY from Data node at: " + socket_address_to_string(packet.addrSrc));
 
                         socket_address addrDataNode = packet.addrSrc;
                         addrDataNode = packet.addrSrc;
@@ -300,9 +365,9 @@ public:
                     }
 
                     case CLIENT_REQUEST_ACK: {
-                        std::cout << "==> HL: " << "Master receives CLIENT_REQUEST_ACK from Data node at: " << socket_address_to_string(packet.addrSrc) << std::endl;
-                        std::cout << "==> HL: " << "filename: " << packet.fileName << std::endl;
-                        std::cout << "==> HL: " << "request: " << packet.request << std::endl;
+                        norm_log("Master receives CLIENT_REQUEST_ACK from Data node at: " + socket_address_to_string(packet.addrSrc));
+                        norm_log("filename: " + packet.fileName);
+                        norm_log("request: " + packet.request);
 
                         switch (packet.request)
                         {
@@ -341,13 +406,13 @@ public:
                                 auto info = infoFiles.find(packet.fileName);
                                 if (info == infoFiles.end()) {
                                     // File not exist, refuse downloading
-                                    std::cout << "==> HL: " << "Cannot find Data node containing file '" << packet.fileName << std::endl;
+                                    norm_log("Cannot find Data node containing file '" + packet.fileName);
 
                                     Packet::compose_RESPONSE_NODE_IP().send(addrClient);
                                 } else {
                                     DataNodeInfo *nodeInfo = info->second.nodesData[0];
-                                    std::cout << "==> HL: " << "Found Data node containing file '" << packet.fileName << "' : " << socket_address_to_string(nodeInfo->addr) << std::endl;
-                                    std::cout << "==> HL: " << "Send Data node's IP to '" << socket_address_to_string(addrClient) << std::endl;
+                                    norm_log("Found Data node containing file '" + packet.fileName + "' : " + socket_address_to_string(nodeInfo->addr));
+                                    norm_log("Send Data node's IP to '" + socket_address_to_string(addrClient));
 
                                     Packet::compose_RESPONSE_NODE_IP(nodeInfo->addr).send(addrClient);
                                 }
@@ -364,11 +429,11 @@ public:
                                     if (bestDataNode == nullptr) {
                                         // Cannot find suitable Data Node to store file
 
-                                        std::cout << "==> HL: " << "Cannot find suitable Data node" << std::endl;
+                                        norm_log("Cannot find suitable Data node");
 
                                         Packet::compose_RESPONSE_NODE_IP().send(addrClient);
                                     } else {
-                                        std::cout << "==> HL: " << "Found suitable Data node: " << socket_address_to_string(bestDataNode->addr) << std::endl;
+                                        norm_log("Found suitable Data node: " + socket_address_to_string(bestDataNode->addr));
 
                                         // Found suitable Data node, insert new entry
                                         infoFiles.insert({packet.fileName, FileInfo(bestDataNode)});
@@ -378,7 +443,7 @@ public:
 
                                 } else {
                                     // File exists -> refuse
-                                    std::cout << "==> HL: " << "File existed: '" << packet.fileName << "'" << std::endl;
+                                    norm_log("File existed: '" + packet.fileName + "'");
                                     Packet::compose_RESPONSE_NODE_IP().send(addrClient);
                                 }
 
@@ -412,7 +477,7 @@ public:
         {
             std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int>(durationHeartbeat * 1000000)));
 
-            std::cout << "==> HL: " << "Start sending heartbeat!" << std::endl;
+            norm_log("Start sending heartbeat!");
 
             mutexInfoDataNode.lock();
 
@@ -423,16 +488,16 @@ public:
                     info.numNonRespHeartBeat++;
 
                     if (info.numNonRespHeartBeat >= MAX_NONRESPONSE_HEARTBEART) {
-                        std::cout << "==> HL: " << "Trigger Replication with: " << socket_address_to_string(info.addr) << std::endl;
+                        norm_log("Trigger Replication with: " + socket_address_to_string(info.addr));
                     }
                     else {
-                        std::cout << "==> HL: " << "Sent heartbeat to: " << socket_address_to_string(info.addr) << std::endl;
+                        norm_log("Sent heartbeat to: " + socket_address_to_string(info.addr));
 
                         try {
                             packetHeartbeat.send(info.addr);
                         }
                         catch (const std::runtime_error& err) {
-                            std::cout << "==> HL: " << "Cannot connect to: " << socket_address_to_string(info.addr) << std::endl;
+                            norm_log("Cannot connect to: " + socket_address_to_string(info.addr));
                         }
                     }
                 }
@@ -447,47 +512,7 @@ public:
     }
 };
 
-// ================================================================
 
-class DNS : public Server
-{
-    socket_address addrCurMaster;
-public:
-    DNS():Server(socket_address(0,0,0,0,0), DNS_PORT){}
-
-    void start() {
-        while (true)
-        {
-            OpenSocket open_socket(SERVER);
-            open_socket.accept_connection(server_socket.get_socket_fd());
-
-            Packet packet = Packet(open_socket);
-            switch (packet.packetID)
-            {
-                case NOTIFY: {
-                    addrCurMaster = packet.addrSrc;
-                    addrCurMaster.port = packet.addrParsed.port;
-
-                    std::cout << "==> HL: " << "Signed up new Master at: " << socket_address_to_string(addrCurMaster) << std::endl;
-
-                    break;
-                }
-
-                case ASK_IP: {
-                    Packet packetReply =  Packet::compose_ASK_IP_ACK(addrCurMaster);
-                    packet.addrSrc.port = packet.addrParsed.port;
-
-                    std::cout << "==> HL: " << "Reply IP: " << socket_address_to_string(packet.addrSrc) << std::endl;
-
-                    packetReply.send(packet.addrSrc);
-
-                    break;
-                }
-            }
-            
-        }
-    }
-};
 
 // ================================================================
 
@@ -522,7 +547,7 @@ public:
                         isAddrMasterReady = true;
                         cv.notify_one();
 
-                        std::cout << "==> HL: " << "DNS replies the current Master node address: " << socket_address_to_string(addrMaster) << std::endl;
+                        norm_log("DNS replies the current Master node address: " + socket_address_to_string(addrMaster));
 
                         break;
                     }
@@ -534,13 +559,13 @@ public:
                         isAddrDataReady = true;
                         cv.notify_one();
 
-                        std::cout << "==> HL: " << "Master replies the Data node address: " << socket_address_to_string(addrData) << std::endl;
+                        norm_log("Master replies the Data node address: " + socket_address_to_string(addrData));
 
                         break;
                     }
 
                     case DATANODE_SEND_DATA: {
-                        std::cout << "==> HL: " << "Data node sends data for file: " << packet.fileName << std::endl;
+                        norm_log("Data node sends data for file: " + packet.fileName);
 
 
                         std::string path = "received_" + packet.fileName;
@@ -583,10 +608,10 @@ public:
         cv.wait(lock2, [this] { return isAddrDataReady; });
 
         if (addrData.port == 0) {
-            std::cout << "==> HL: " << "No Data node available to upload file. Terminating..." << std::endl;
+            norm_log("No Data node available to upload file. Terminating...");
             std::exit(0);
         } else {    
-            std::cout << "==> HL: " << "Found suitable Data node available to upload file" << std::endl;
+            norm_log("Found suitable Data node available to upload file");
 
             Packet packetBinary = Packet::compose_CLIENT_UPLOAD(nameFile, binary);
             packetBinary.send(addrData);
@@ -618,10 +643,10 @@ public:
         cv.wait(lock2, [this] { return isAddrDataReady; });
 
         if (addrData.port == 0) {
-            std::cout << "==> HL: " << "No Data node storing the neeed file. Terminating..." << std::endl;
+            norm_log("No Data node storing the neeed file. Terminating...");
             std::exit(0);
         } else {    
-            std::cout << "==> HL: " << "Found Data node having needed file" << std::endl;
+            norm_log("Found Data node having needed file");
 
             Packet packetBinary = Packet::compose_ASK_READ_WRITE(REQUEST::DOWNLOAD, nameFile, port);
             packetBinary.send(addrData);
