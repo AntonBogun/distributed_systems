@@ -282,7 +282,7 @@ int main(int argc, char *argv[])
     return test();//./bin/main
     // return node_main(argc, argv);
 }
-#if TEMP
+
 int node_main(int argc, char *argv[])
 {
     // Parse arguments
@@ -388,7 +388,7 @@ int node_main(int argc, char *argv[])
     
     return 0;
 }
-#endif
+
 // g++ -std=c++17 -o main main.cpp -Wall -Wextra -Wshadow
 // master: ./bin/main -mode master
 // data: ./bin/main -mode data

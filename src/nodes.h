@@ -1,5 +1,3 @@
-#define TEMP 0
-#if TEMP
 #pragma once
 #include "transmission.h"
 #include "packets.h"
@@ -23,13 +21,6 @@ class Node{
     socket_address dns_address;
     Node(socket_address dns_address_):dns_address(dns_address_){}
 };
-struct connection_stats{
-    bool is_outgoing;
-    int fd;
-    socket_address other_addr;
-    in_port_t local_port;
-    std::thread& thread;
-};
 #define continue_on_err(x) \
     {                           \
         if (x)                  \
@@ -38,46 +29,119 @@ struct connection_stats{
         }                       \
     }
 
+struct connection_struct{
+    connection_info connection_info;
+    uptr<OpenSocket> open_socket;
+    uptr<TransmissionLayer> tl;
+    std::thread::id owner_thread_id;
+    std::atomic<bool> request_close = false;
+};
+struct thread_struct{
+    std::vector<sptr<connection_struct>> owned_connections;
+    uptr<std::thread> thread;
+    std::atomic<bool> request_close = false;
+};
 class Server: public Node
 {
 public:
     ServerSocket server_socket;
+
     std::mutex connections_mutex;
-    std::unordered_map<connection_info, connection_stats> connections;
+    //% must hold connections_mutex to access
+    std::unordered_map<connection_info, sptr<connection_struct>> connections;
+    //% must hold connections_mutex to access
+    std::unordered_map<std::thread::id, sptr<thread_struct>> threads;
+    //% intended to be used with connections_mutex
+    std::condition_variable can_exit_cv;
+
     Server(socket_address dns_address_, in_port_t port): Node(dns_address_), server_socket(port)
     {}//server_socket constructor already starts listening
 
     void start() {
         while (true)
         {
-            OpenSocket open_socket(SERVER);
-            continue_on_err(open_socket.accept_connection(server_socket.get_socket_fd()));
-
-            Packet packet = Packet(open_socket);
-            switch (packet.packetID)
-            {
-                case NOTIFY: {
-                    addrCurMaster = packet.addrSrc;
-                    addrCurMaster.port = packet.addrParsed.port;
-
-                    norm_log("Signed up new Master at: " + socket_address_to_string(addrCurMaster));
-
-                    break;
-                }
-
-                case ASK_IP: {
-                    Packet packetReply =  Packet::compose_ASK_IP_ACK(addrCurMaster);
-                    packet.addrSrc.port = packet.addrParsed.port;
-
-                    norm_log("Reply IP: " + socket_address_to_string(packet.addrSrc));
-
-                    packetReply.send(packet.addrSrc);
-
-                    break;
-                }
-            }
+            // OpenSocket open_socket(SERVER);
+            uptr<OpenSocket> open_socket = std::make_unique<OpenSocket>(SERVER);
+            continue_on_err(open_socket->accept_connection(server_socket.get_socket_fd()));
             
+            connection_info connection_info(open_socket->local_address, open_socket->other_address);
+            sptr<connection_struct> connection = std::make_shared<connection_struct>();
+            connection->open_socket = std::move(open_socket);
+            connection->connection_info = connection_info;
+            {
+                std::lock_guard<std::mutex> lock(connections_mutex);
+                connections[connection_info] = connection;
+                uptr<std::thread> thread = 
+                std::make_unique<std::thread>(&Server::setup_thread, this, connection_info, connection);
+                threads[thread->get_id()] = std::make_shared<thread_struct>();
+                threads[thread->get_id()]->thread = std::move(thread);
+                connection->owner_thread_id = thread->get_id();
+                threads[thread->get_id()]->owned_connections.push_back(connection);
+            }
         }
+    }
+    //% do not use without lock, but can chain together without releasing the lock every time
+    //! does not remove the connection from the thread's owned_connections
+    void _remove_connection_no_lock(connection_info connection_info){
+        connections.erase(connection_info);
+    }
+    //! does not remove the connection from the thread's owned_connections
+    //* use _remove_connection_no_lock if you already have the lock or removing multiple connections
+    void remove_connection(connection_info connection_info){
+        std::lock_guard<std::mutex> lock(connections_mutex);
+        _remove_connection_no_lock(connection_info);
+    }
+    //! should only be called from the thread being removed
+    void remove_thread(std::thread::id thread_id){
+        std::lock_guard<std::mutex> lock(connections_mutex);
+        throw_if(not_in(thread_id, threads), "Thread not found in threads map");
+        
+        sptr<thread_struct> this_thread = threads[thread_id];
+        for(auto &connection: this_thread->owned_connections){
+            _remove_connection_no_lock(connection->connection_info);
+            throw_if(connection.use_count() != 1,
+            "Connection still has other owners "+std::to_string(connection.use_count()));
+        }
+        this_thread->owned_connections.clear();
+        threads.erase(thread_id);
+        throw_if(this_thread.use_count() != 1,
+        "Thread still has other owners: "+std::to_string(this_thread.use_count()));
+        this_thread.reset();
+        can_exit_cv.notify_all();
+    }
+    //%notice that connection is not a reference to the sptr, it is a new sptr
+    //*after handle_first_connection, the only owner of this_thread should be this function so it can safely delete itself
+    void setup_thread(connection_info connection_info, sptr<connection_struct> connection){
+        std::thread::id this_thread_id = std::this_thread::get_id();
+        sptr<thread_struct> this_thread;
+        {
+            //lock to let the creator finish setting the thread into the map
+            std::lock_guard<std::mutex> lock(connections_mutex);
+            throw_if(not_in(this_thread_id, threads), "Thread not found in threads map");
+            this_thread = threads[this_thread_id];//minor optimization could be to not discard not_in result
+            throw_if(not_in(connection_info, connections), "Connection not found in connections map");
+            throw_if(connection.get() != connections[connection_info].get(), "Connections mismatch");
+            throw_if(connection.get() != this_thread->owned_connections.back().get(), "Connection stack mismatch");
+            throw_if(this_thread_id != connection->owner_thread_id, "Thread id mismatch");
+            //%from here assume that connections and threads are consistent
+        }
+        uptr<TransmissionLayer> tl = std::make_unique<TransmissionLayer>(*connection->open_socket);
+        connection->tl = std::move(tl);
+        //check definition of THROW_IF_RECOVERABLE
+        THROW_IF_RECOVERABLE(tl->initialize_recv(), "Failed to initialize recv", 
+            {
+                //release this_thread
+                this_thread.reset();
+                remove_thread(this_thread_id); 
+                return;
+            }
+        );
+        handle_first_connection(this_thread);
+        
+    }
+    virtual void handle_first_connection(sptr<thread_struct> this_thread) = 0;
+    ~Server(){
+        can_exit_cv.notify_all();
     }
 };
 //MASTER/MASTER_BACKUP/DATA
@@ -88,13 +152,75 @@ enum node_role{
 };
 
 // ================================================================
+//move from packets.h
+enum PACKET_ID : u8
+{
+    REQUEST_OPEN_HEARTBEAT_CONNECTION=0, // master -> data nodes
+    REQUEST_MASTER_ADDRESS=1,            // client -> dns
+    SET_MASTER_ADDRESS=2,                // master -> both dns and data nodes
+    REQUEST_LIST_OF_ALL_NODES=3,         // master -> dns
+    EDIT_LIST_OF_ALL_NODES=4,            // master -> dns
+    SET_DATA_NODE_AS_BACKUP=5,           // master -> data node
+    CLIENT_CONNECTION_REQUEST=6,         // client -> both to master and data nodes
+    DATA_NODE_TO_MASTER_CONNECTION_REQUEST=7, // data node -> master
+    MASTER_NODE_TO_DATA_NODE_REPLICATION_REQUEST=8, // master -> data node
+    DATA_NODE_TO_DATA_NODE_CONNECTION_REQUEST=9, // data node -> data node
+    MASTER_TO_DATA_NODE_INFO_REQUEST=10,  // master -> data node
+    MASTER_TO_DATA_NODE_PAUSE_CHANGE=11   // master -> data node
+};
 
+
+enum REQUEST : u8
+{
+    DOWNLOAD,
+    UPLOAD
+};
+static_assert(sizeof(PACKET_ID) == 1, "Packet ID must be 1 byte");
+static_assert(sizeof(REQUEST) == 1, "Request must be 1 byte");
+
+// ================================================================
 class DNS : public Server
 {
 public:
     DNS():Server(socket_address(0,0,0,0,0), DNS_PORT){}
     socket_address addrCurMaster;
     std::unordered_set<socket_address> nodes;
+    std::mutex mutexNodes;
+
+    void handle_connection(sptr<thread_struct> this_thread) override {
+        OpenSocket &open_socket = *connection->open_socket;
+        while (true)
+        {
+            Packet packet = Packet(open_socket);
+            switch (packet.packetID)
+            {
+                case REQUEST_MASTER_ADDRESS:
+                {
+                    Packet packetResponse = Packet::compose_RESPONSE_NODE_IP(addrCurMaster);
+                    packetResponse.send(open_socket.other_address);
+                    break;
+                }
+                case SET_MASTER_ADDRESS:
+                {
+                    addrCurMaster = packet.addrParsed;
+                    break;
+                }
+                case REQUEST_LIST_OF_ALL_NODES:
+                {
+                    std::lock_guard<std::mutex> lock(mutexNodes);
+                    Packet packetResponse = Packet::compose_RESPONSE_LIST_OF_NODES(nodes);
+                    packetResponse.send(open_socket.other_address);
+                    break;
+                }
+                case EDIT_LIST_OF_ALL_NODES:
+                {
+                    std::lock_guard<std::mutex> lock(mutexNodes);
+                    nodes = packet.nodes;
+                    break;
+                }
+            }
+        }
+    }
 
 };
 // ================================================================
@@ -662,4 +788,3 @@ public:
 
 
 }//namespace distribsys
-#endif

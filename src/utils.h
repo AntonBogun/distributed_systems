@@ -28,6 +28,11 @@ using i16 = int16_t;
 
 using u8 = uint8_t;
 using i8 = int8_t;
+template<typename T>
+using uptr = std::unique_ptr<T>;
+template<typename T>
+using sptr = std::shared_ptr<T>;
+
 
 
 inline i64 mod(i64 a, i64 b) {
@@ -471,6 +476,11 @@ inline void fill_vector(V& vec, T val){
     for(i32 i=0; i<vec.size(); i++){
         vec[i]=val;
     }
+}
+//~container.find(val)==container.end();
+template <typename V, typename T>
+inline bool not_in(const T& val, const V& container){
+    return container.find(val)==container.end();
 }
 
 template<typename T, typename... Args>

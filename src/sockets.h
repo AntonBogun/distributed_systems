@@ -84,8 +84,7 @@ struct socket_address
         return saddr;
     }
 
-    struct sockaddr_in to_sockaddr_in()
-    {
+    struct sockaddr_in to_sockaddr_in() const {
         struct sockaddr_in addr;
         addr.sin_family = AF_INET;
         addr.sin_addr = ip.to_in_addr();
@@ -333,11 +332,6 @@ void set_timeout_throw(const file_descriptor& socket_fd, TimeValue timeout)
     throw_if(setsockopt(socket_fd.get_fd(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0,
              prints_new("Failed to set SO_SNDTIMEO, errno:", errno));
 }
-u64 get_thread_id()
-{
-    //can't rely on get_id being u64
-    return std::hash<std::thread::id>{}(std::this_thread::get_id());
-}
 //% true means error + errno set
 [[nodiscard]]
 bool set_socket_send_timeout(const file_descriptor& socket_fd, TimeValue timeout)
@@ -388,23 +382,22 @@ public:
         printcout("Listening for connections...");
     }
     //!NOTE: ServerSocket MUST BE ALIVE for the entire duration of usage of the file_descriptor
-    const file_descriptor& get_socket_fd()
+    const file_descriptor& get_socket_fd() const
     {
         return socket_fd;
     }
 };
-//should actually be a full socket_address for the local, but we dont expect multiple interfaces
-//unused for now
+
 struct connection_info
 {
-    in_port_t local_port;
+    socket_address local_address;
     socket_address external_address;
-    connection_info(in_port_t local_port_, socket_address external_address_) : local_port(local_port_), external_address(external_address_) {}
-    connection_info() : local_port(0), external_address() {}
+    connection_info(socket_address local_address_, socket_address external_address_) : local_address(local_address_), external_address(external_address_) {}
+    connection_info() : local_address(), external_address() {}
 
     bool operator==(connection_info other) const
     {
-        return local_port == other.local_port && external_address == other.external_address;
+        return local_address == other.local_address && external_address == other.external_address;
     }
     bool operator!=(connection_info other) const
     {
@@ -413,7 +406,7 @@ struct connection_info
     std::string to_string() const
     {
         std::stringstream ss;
-        ss << "(port " << local_port << ", external: " << socket_address_to_string(external_address) << ")";
+        ss << "(local: " << socket_address_to_string(local_address) << ", external: " << socket_address_to_string(external_address) << ")";
         return ss.str();
     }
 };
@@ -444,7 +437,7 @@ namespace std{
     template<>
     struct hash<distribsys::connection_info>{
         std::size_t operator()(const distribsys::connection_info& info) const noexcept{
-            return std::hash<in_port_t>{}(info.local_port) ^ std::hash<distribsys::socket_address>{}(info.external_address);
+            return std::hash<distribsys::socket_address>{}(info.local_address) ^ std::hash<distribsys::socket_address>{}(info.external_address);
         }
     };
 }

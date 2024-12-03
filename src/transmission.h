@@ -16,6 +16,7 @@
 
 namespace distribsys{
 
+constexpr bool THROW_ON_RECOVERABLE = false;
 
 //client or server
 enum SOCKET_TYPE
@@ -59,18 +60,19 @@ public:
     FCVector<char> out_buffer;
 
     file_descriptor allocated_fd; // file descriptor associated with socket
+    socket_address local_address;
     socket_address other_address;
     SOCKET_TYPE sock_type;
-    bool throw_on_recoverable=false;
+
     bool is_valid() const { return allocated_fd.is_valid(); }
 
 
-#define THROW_IF_RECOVERABLE(x,s)\
+#define THROW_IF_RECOVERABLE(x,s,default_action)\
 if(x){\
-    if(throw_on_recoverable){\
+    if(THROW_ON_RECOVERABLE){\
         throw std::runtime_error(s);\
     }else{\
-        return true;\
+        default_action\
     }\
 }
 
@@ -112,9 +114,10 @@ if(x){\
             } else {break;}
         }
         THROW_IF_RECOVERABLE(!allocated_fd.is_valid(),
-                 prints_new("Failed to accept connection, errno:", errno));
+                 prints_new("Failed to accept connection, errno:", errno), return true;);
 
         socket_address client_fd_address = allocated_fd.remote_address();
+        local_address = allocated_fd.local_address();
 
         throw_if(client_fd_address != other_address,
                  prints_new("Accept address mismatch: ", socket_address_to_string(client_fd_address), " != ", socket_address_to_string(other_address)));
@@ -152,11 +155,12 @@ if(x){\
                 }
             } else {break;}
         }
-        THROW_IF_RECOVERABLE(!success, prints_new("Failed to connect to server, errno:", errno));
+        THROW_IF_RECOVERABLE(!success, prints_new("Failed to connect to server, errno:", errno), return true;);
 
         other_address = address;
 
         socket_address server_fd_address = allocated_fd.remote_address();
+        local_address = allocated_fd.local_address();
 
         throw_if(server_fd_address != other_address,
                  prints_new("Connect address mismatch: ", socket_address_to_string(server_fd_address), " != ", socket_address_to_string(other_address)));
@@ -228,7 +232,7 @@ class TransmissionLayer{
     bool recv_batch_continue = false;
 
 
-    double get_throughput(){
+    double get_throughput() const {
         if(batch_send_info_cumulative.first.is_near(0)){
             return 0;
         }
@@ -287,10 +291,10 @@ class TransmissionLayer{
             throw_if(!sock.is_valid(), "Socket not valid on TransmissionLayer creation");
         }
 
-    inline char* out_buf_at(int offset){
+    inline char* out_buf_at(int offset) const{
         return sock.out_buffer.data()+offset;
     }
-    inline char* in_buf_at(int offset){
+    inline char* in_buf_at(int offset) const{
         return sock.in_buffer.data()+offset;
     }
 
@@ -562,7 +566,7 @@ class TransmissionLayer{
         static_assert(std::is_trivially_copyable<T>::value, "Type must be trivially copyable");
         return read_bytes(reinterpret_cast<char*>(&val), sizeof(T));
     }
-    void print_errors(){
+    void print_errors() const {
         double throughput;
         switch(last_error){
             case error_code::NO_ERROR:
