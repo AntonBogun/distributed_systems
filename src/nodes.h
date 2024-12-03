@@ -1,3 +1,5 @@
+#define TEMP 0
+#if TEMP
 #pragma once
 #include "transmission.h"
 #include "packets.h"
@@ -660,3 +662,4 @@ public:
 
 
 }//namespace distribsys
+#endif

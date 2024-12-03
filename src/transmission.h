@@ -45,32 +45,6 @@ constexpr int MAX_DATA_SIZE = MAX_MESSAGE_SIZE - TRANSMISSION_LAYER_HEADER;
 //0
 const TimeValue NO_DELAY{0.0};
 
-#define DEBUG_PRINTS 0
-
-
-static std::mutex io_mutex;
-// safely print to cout on multiple threads
-#define MUTEX_PRINT(x)                              \
-    do                                              \
-    {                                               \
-        std::lock_guard<std::mutex> lock(io_mutex); \
-        std::cout << x << std::endl;                \
-    } while (0)
-#define MUTEX_PRINT_INLINE(x)                       \
-    do                                              \
-    {                                               \
-        std::lock_guard<std::mutex> lock(io_mutex); \
-        std::cout << x << std::endl;                \
-    } while (0)
-
-#if DEBUG_PRINTS
-#define DEBUG_PRINT(x) MUTEX_PRINT(x)
-#define DEBUG_PRINT_INLINE(x) MUTEX_PRINT_INLINE(x)
-#else
-#define DEBUG_PRINT(x)
-#define DEBUG_PRINT_INLINE(x)
-#endif
-
 
 static_assert(sizeof(int) == sizeof(i32), "int and i32 must be the same size");
 
@@ -89,6 +63,8 @@ public:
     SOCKET_TYPE sock_type;
     bool throw_on_recoverable=false;
     bool is_valid() const { return allocated_fd.is_valid(); }
+
+
 #define THROW_IF_RECOVERABLE(x,s)\
 if(x){\
     if(throw_on_recoverable){\
@@ -138,13 +114,13 @@ if(x){\
         THROW_IF_RECOVERABLE(!allocated_fd.is_valid(),
                  prints_new("Failed to accept connection, errno:", errno));
 
-        socket_address client_fd_address = socket_address::from_fd_remote(allocated_fd);
+        socket_address client_fd_address = allocated_fd.remote_address();
 
         throw_if(client_fd_address != other_address,
                  prints_new("Accept address mismatch: ", socket_address_to_string(client_fd_address), " != ", socket_address_to_string(other_address)));
 
         verbose_log(prints_new("Accepted connection from client: ", socket_address_to_string(other_address),
-                               " to server: ", socket_address_to_string(socket_address::from_fd_local(allocated_fd))));
+                               " to server: ", socket_address_to_string(allocated_fd.local_address())));
         return false;
     }
     //% return true if timeout
@@ -180,13 +156,13 @@ if(x){\
 
         other_address = address;
 
-        socket_address server_fd_address = socket_address::from_fd_remote(allocated_fd);
+        socket_address server_fd_address = allocated_fd.remote_address();
 
         throw_if(server_fd_address != other_address,
                  prints_new("Connect address mismatch: ", socket_address_to_string(server_fd_address), " != ", socket_address_to_string(other_address)));
 
         verbose_log(prints_new("Connected to server: ", socket_address_to_string(other_address),
-                               " from client: ", socket_address_to_string(socket_address::from_fd_local(allocated_fd))));
+                               " from client: ", socket_address_to_string(allocated_fd.local_address())));
         return false;
     }
     [[nodiscard]]
@@ -502,6 +478,7 @@ class TransmissionLayer{
                 return true;
             }
             // throw_if(valrecv == 0, "Unexpected valrecv == 0 on recv_n");//~should never happen
+            //~can actually happen: https://stackoverflow.com/questions/38021659/can-a-c-socket-recv-0-bytes-without-the-client-shutting-the-connection
             else if (valrecv == 0){
                 last_error = error_code::CONNECTION_CLOSED;
                 return true;

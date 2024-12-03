@@ -1,3 +1,4 @@
+#pragma once
 #include "utils.h"
 #include <mutex>
 #include <atomic>
@@ -24,6 +25,15 @@ namespace distribsys{
     void verbose_log(const std::string &msg){
         prefix_log("==> HL: ", msg);
     }
+    void debug_log(const std::string &msg){
+        prefix_log("==> HL: ", msg);
+    }
+    #define DEBUG_PRINTS 0
+    #if DEBUG_PRINTS
+    #define DEBUG_PRINT(x) debug_log(x)
+    #else
+    #define DEBUG_PRINT(x)
+    #endif
 
 
 

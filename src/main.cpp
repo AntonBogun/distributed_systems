@@ -277,8 +277,13 @@ int cerr_and_return(const std::string msg, int exit_code=error_exit_code) {
     std::cerr << msg << std::endl;
     return exit_code;
 }
-
 int main(int argc, char *argv[])
+{
+    return test();//./bin/main
+    // return node_main(argc, argv);
+}
+#if TEMP
+int node_main(int argc, char *argv[])
 {
     // Parse arguments
     int i = 1;
@@ -383,6 +388,7 @@ int main(int argc, char *argv[])
     
     return 0;
 }
+#endif
 // g++ -std=c++17 -o main main.cpp -Wall -Wextra -Wshadow
 // master: ./bin/main -mode master
 // data: ./bin/main -mode data

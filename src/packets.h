@@ -1,3 +1,4 @@
+#if TEMP
 #pragma once
 
 #include <cstddef>
@@ -405,3 +406,4 @@ public:
 };
 
 }//namespace distribsys
+#endif

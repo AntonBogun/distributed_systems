@@ -83,20 +83,7 @@ struct socket_address
         saddr.port = ntohs(addr.sin_port);
         return saddr;
     }
-    static socket_address from_fd_local(const file_descriptor& fd)
-    {
-        struct sockaddr_in addr;
-        socklen_t len = sizeof(addr);
-        getsockname(fd.get_fd(), (struct sockaddr *)&addr, &len);
-        return from_sockaddr_in(addr);
-    }
-    static socket_address from_fd_remote(const file_descriptor& fd)
-    {
-        struct sockaddr_in addr;
-        socklen_t len = sizeof(addr);
-        getpeername(fd.get_fd(), (struct sockaddr *)&addr, &len);
-        return from_sockaddr_in(addr);
-    }
+
     struct sockaddr_in to_sockaddr_in()
     {
         struct sockaddr_in addr;
@@ -172,6 +159,18 @@ public:
     }
     ssize_t Recv(void *buf, size_t len, int flags) const {
         return recv(fd, buf, len, flags);
+    }
+    socket_address local_address() const {
+        struct sockaddr_in addr;
+        socklen_t len = sizeof(addr);
+        getsockname(get_fd(), (struct sockaddr *)&addr, &len);
+        return socket_address::from_sockaddr_in(addr);
+    }
+    socket_address remote_address() const {
+        struct sockaddr_in addr;
+        socklen_t len = sizeof(addr);
+        getpeername(get_fd(), (struct sockaddr *)&addr, &len);
+        return socket_address::from_sockaddr_in(addr);
     }
 
     ~file_descriptor(){
@@ -376,7 +375,7 @@ public:
         throw_if(bind(socket_fd.get_fd(), (struct sockaddr *)&bind_address, sizeof(bind_address)) < 0,
                  prints_new("Failed to bind socket, errno:", errno));
 
-        socket_address bound_address = socket_address::from_fd_local(socket_fd);
+        socket_address bound_address = socket_fd.local_address();
 
         throw_if(bound_address.port != port,
                  prints_new("Bind port mismatch: bound ", bound_address.port, " != target ", port));
@@ -427,13 +426,13 @@ namespace std{
     template<>
     struct hash<distribsys::ipv4_addr>{
         std::size_t operator()(const distribsys::ipv4_addr& ip) const noexcept{
-            return std::hash<u32>{}(ip.to_u32());
+            return std::hash<distribsys::u32>{}(ip.to_u32());
         }
     };
     template<>
     struct hash<distribsys::socket_address>{
         std::size_t operator()(const distribsys::socket_address& addr) const noexcept{
-            return std::hash<u32>{}(addr.ip.to_u32()) ^ std::hash<in_port_t>{}(addr.port);
+            return std::hash<distribsys::u32>{}(addr.ip.to_u32()) ^ std::hash<in_port_t>{}(addr.port);
         }
     };
     template<>
