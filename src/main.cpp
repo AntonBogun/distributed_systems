@@ -21,6 +21,7 @@ namespace distribsys{
     std::atomic<bool> _do_logging = true;
     std::atomic<bool> _do_verbose = false;
     std::mutex _mutex_logging;
+    std::mutex ifaddrs_mutex;
 }
 
 using namespace distribsys;
@@ -47,64 +48,7 @@ std::string rate_to_string(double rate)
     return ss.str();
 }
 
-std::vector<ipv4_addr> getIPAddresses()
-{
-    std::vector<ipv4_addr> addresses;
-    struct ifaddrs *ifAddrStruct = nullptr;
-    struct ifaddrs *ifa = nullptr;
 
-    if (getifaddrs(&ifAddrStruct) == -1)
-    {
-        throw std::runtime_error("Failed to get network interfaces");
-    }
-
-    for (ifa = ifAddrStruct; ifa != nullptr; ifa = ifa->ifa_next)
-    {
-        if (!ifa->ifa_addr)
-        {
-            continue;
-        }
-
-        // Check for IPv4 addresses
-        if (ifa->ifa_addr->sa_family == AF_INET)
-        {
-            auto *sockaddr_in_ptr = reinterpret_cast<struct sockaddr_in *>(ifa->ifa_addr);
-            void *tmpAddrPtr = &sockaddr_in_ptr->sin_addr;
-
-            printcout(prints_new(
-                "family: ", ifa->ifa_addr->sa_family,
-                "sin_port: ", sockaddr_in_ptr->sin_port,
-                "sin_addr: ", ip_to_string(ipv4_addr::from_in_addr(sockaddr_in_ptr->sin_addr))));
-
-            char addressBuffer[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, tmpAddrPtr, addressBuffer, INET_ADDRSTRLEN);
-
-            // Skip localhost addresses
-            if (strcmp(addressBuffer, "127.0.0.1") != 0)
-            {
-                addresses.push_back(ipv4_addr::from_in_addr(sockaddr_in_ptr->sin_addr));
-            }
-        }
-        // // Optionally check for IPv6 addresses
-        // else if (ifa->ifa_addr->sa_family == AF_INET6) {
-        //     void* tmpAddrPtr = &((struct sockaddr_in6*)ifa->ifa_addr)->sin6_addr;
-        //     char addressBuffer[INET6_ADDRSTRLEN];
-        //     inet_ntop(AF_INET6, tmpAddrPtr, addressBuffer, INET6_ADDRSTRLEN);
-
-        //     // Skip localhost addresses
-        //     if (strcmp(addressBuffer, "::1") != 0) {
-        //         addresses.push_back(addressBuffer);
-        //     }
-        // }
-    }
-
-    if (ifAddrStruct != nullptr)
-    {
-        freeifaddrs(ifAddrStruct);
-    }
-
-    return addresses;
-}
 #define TL_ERR_and_return(x, y) \
     {                           \
         if (x)                  \

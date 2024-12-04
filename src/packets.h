@@ -13,28 +13,28 @@ typedef std::vector<u8> BYTES;
 inline void convUInt16ToBytes(uint16_t *src, uint8_t *dst) {memcpy(dst, src, 2);}
 inline void convBytesToUInt16(uint8_t *src, uint16_t *dst) {memcpy(dst, src, 2);}
 
-enum PACKET_ID : u8
-{
-    REQUEST_OPEN_HEARTBEAT_CONNECTION=0, // master -> data nodes
-    REQUEST_MASTER_ADDRESS=1,            // client -> dns
-    SET_MASTER_ADDRESS=2,                // master -> both dns and data nodes
-    REQUEST_LIST_OF_ALL_NODES=3,         // master -> dns
-    EDIT_LIST_OF_ALL_NODES=4,            // master -> dns
-    SET_DATA_NODE_AS_BACKUP=5,           // master -> data node
-    CLIENT_CONNECTION_REQUEST=6,         // client -> both to master and data nodes
-    DATA_NODE_TO_MASTER_CONNECTION_REQUEST=7, // data node -> master
-    MASTER_NODE_TO_DATA_NODE_REPLICATION_REQUEST=8, // master -> data node
-    DATA_NODE_TO_DATA_NODE_CONNECTION_REQUEST=9, // data node -> data node
-    MASTER_TO_DATA_NODE_INFO_REQUEST=10,  // master -> data node
-    MASTER_TO_DATA_NODE_PAUSE_CHANGE=11   // master -> data node
-};
+// enum PACKET_ID : u8
+// {
+//     REQUEST_OPEN_HEARTBEAT_CONNECTION=0, // master -> data nodes
+//     REQUEST_MASTER_ADDRESS=1,            // client -> dns
+//     SET_MASTER_ADDRESS=2,                // master -> both dns and data nodes
+//     REQUEST_LIST_OF_ALL_NODES=3,         // master -> dns
+//     EDIT_LIST_OF_ALL_NODES=4,            // master -> dns
+//     SET_DATA_NODE_AS_BACKUP=5,           // master -> data node
+//     CLIENT_CONNECTION_REQUEST=6,         // client -> both to master and data nodes
+//     DATA_NODE_TO_MASTER_CONNECTION_REQUEST=7, // data node -> master
+//     MASTER_NODE_TO_DATA_NODE_REPLICATION_REQUEST=8, // master -> data node
+//     DATA_NODE_TO_DATA_NODE_CONNECTION_REQUEST=9, // data node -> data node
+//     MASTER_TO_DATA_NODE_INFO_REQUEST=10,  // master -> data node
+//     MASTER_TO_DATA_NODE_PAUSE_CHANGE=11   // master -> data node
+// };
 
 
-enum REQUEST : u8
-{
-    DOWNLOAD,
-    UPLOAD
-};
+// enum REQUEST : u8
+// {
+//     DOWNLOAD,
+//     UPLOAD
+// };
 
 
 constexpr u8 BYTE_SEP_CHARACTER = 124;      // byte value of character '|'

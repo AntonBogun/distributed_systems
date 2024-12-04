@@ -15,10 +15,12 @@
 #include <mutex>
 namespace distribsys{
 
-#define throw_if(condition, message)       \
-    if (condition)                         \
-    {                                      \
-        throw std::runtime_error(message); \
+#define throw_if(condition, message)                                      \
+    if (condition)                                                        \
+    {                                                                     \
+        throw std::runtime_error(std::string(message) +                   \
+                                 "; in file " + __FILE__ +                \
+                                 " at line " + std::to_string(__LINE__)); \
     }
 
 struct ipv4_addr
@@ -61,6 +63,9 @@ struct ipv4_addr
     bool operator!=(ipv4_addr other) const
     {
         return !(*this == other);
+    }
+    bool is_unset() const {
+        return a==0 && b==0 && c==0 && d==0;
     }
 };
 
@@ -107,7 +112,75 @@ struct socket_address
     {
         return !(*this == other);
     }
+    //% uses 0.0.0.0:0 as unset
+    bool is_unset() const {
+        return ip.is_unset() && port==0;
+    }
 };
+
+extern std::mutex ifaddrs_mutex;
+std::vector<ipv4_addr> getIPAddresses()
+{
+    //> unsafe to call this function concurrently
+    std::lock_guard<std::mutex> lock(ifaddrs_mutex);
+
+    std::vector<ipv4_addr> addresses;
+    struct ifaddrs *ifAddrStruct = nullptr;
+    struct ifaddrs *ifa = nullptr;
+
+    if (getifaddrs(&ifAddrStruct) == -1)
+    {
+        throw std::runtime_error("Failed to get network interfaces");
+    }
+
+    for (ifa = ifAddrStruct; ifa != nullptr; ifa = ifa->ifa_next)
+    {
+        if (!ifa->ifa_addr)
+        {
+            continue;
+        }
+
+        // Check for IPv4 addresses
+        if (ifa->ifa_addr->sa_family == AF_INET)
+        {
+            auto *sockaddr_in_ptr = reinterpret_cast<struct sockaddr_in *>(ifa->ifa_addr);
+            void *tmpAddrPtr = &sockaddr_in_ptr->sin_addr;
+
+            printcout(prints_new(
+                "family: ", ifa->ifa_addr->sa_family,
+                "sin_port: ", sockaddr_in_ptr->sin_port,
+                "sin_addr: ", ip_to_string(ipv4_addr::from_in_addr(sockaddr_in_ptr->sin_addr))));
+
+            char addressBuffer[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, tmpAddrPtr, addressBuffer, INET_ADDRSTRLEN);
+
+            // Skip localhost addresses
+            if (strcmp(addressBuffer, "127.0.0.1") != 0)
+            {
+                addresses.push_back(ipv4_addr::from_in_addr(sockaddr_in_ptr->sin_addr));
+            }
+        }
+        // // Optionally check for IPv6 addresses
+        // else if (ifa->ifa_addr->sa_family == AF_INET6) {
+        //     void* tmpAddrPtr = &((struct sockaddr_in6*)ifa->ifa_addr)->sin6_addr;
+        //     char addressBuffer[INET6_ADDRSTRLEN];
+        //     inet_ntop(AF_INET6, tmpAddrPtr, addressBuffer, INET6_ADDRSTRLEN);
+
+        //     // Skip localhost addresses
+        //     if (strcmp(addressBuffer, "::1") != 0) {
+        //         addresses.push_back(addressBuffer);
+        //     }
+        // }
+    }
+
+    if (ifAddrStruct != nullptr)
+    {
+        freeifaddrs(ifAddrStruct);
+    }
+
+    return addresses;
+}
+
 struct file_descriptor{
     int fd=-1;
 public:
@@ -360,9 +433,10 @@ constexpr int BACKLOG = 5;
 class ServerSocket
 {
     file_descriptor socket_fd;
+    const in_port_t port;
 
 public:
-    ServerSocket(in_port_t port)
+    ServerSocket(in_port_t port_) : port(port_)
     {
 
         socket_fd = create_socket_throw();
@@ -393,6 +467,10 @@ public:
     const file_descriptor& get_socket_fd() const
     {
         return socket_fd;
+    }
+    const in_port_t get_port() const
+    {
+        return port;
     }
 };
 

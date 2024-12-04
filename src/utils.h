@@ -571,6 +571,7 @@ class ThrowingOfstream : public std::ofstream {
             return false;
         }
     }
+
     static bool check_file_exists(const std::string &filepath) {
         return std::filesystem::exists(filepath);
     }

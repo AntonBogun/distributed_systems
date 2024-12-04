@@ -20,13 +20,18 @@ constexpr bool THROW_ON_RECOVERABLE = false;
 //> this is used in the case when we'd like to setup debugging to throw on recoverable errors
 //> otherwise default action is taken, which should should correspond to silently handling the error
 //> also useful because it shows clearly in code that this is an error but recoverable
-#define THROW_IF_RECOVERABLE(x,s,default_action)\
-if(x){\
-    if(THROW_ON_RECOVERABLE){\
-        throw std::runtime_error(s);\
-    }else{\
-        default_action\
-    }\
+#define THROW_IF_RECOVERABLE(x, s, default_action)                        \
+if (x) {                                                                  \
+    if constexpr (THROW_ON_RECOVERABLE) {                                 \
+        throw std::runtime_error(std::string(s) +                         \
+                                 "; in file " + __FILE__ +                \
+                                 " at line " + std::to_string(__LINE__)); \
+    } else {                                                              \
+        err_log(std::string(s) +                                          \
+                "; in file " + __FILE__ +                                 \
+                " at line " + std::to_string(__LINE__));                  \
+        default_action                                                    \
+    }                                                                     \
 }
 
 //client or server

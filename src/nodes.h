@@ -7,9 +7,10 @@
 #include <mutex>
 #include <thread>
 #include <bits/stdc++.h>
-#include<fstream>
+#include <fstream>
 #include <queue>
 #include <map>
+#include <random>
 
 namespace distribsys{
 
@@ -28,7 +29,8 @@ class Node{
             continue;           \
         }                       \
     }
-
+//> has addresses of both ends in connection_info, unique_ptr of OpenSocket and TransmissionLayer
+//> also has the thread id of owner thread and a flag to request connection close
 struct connection_struct{
     connection_info connection_info;
     uptr<OpenSocket> open_socket;
@@ -36,40 +38,76 @@ struct connection_struct{
     std::thread::id owner_thread_id;
     std::atomic<bool> request_close = false;
 };
+//> has a vector of connections owned by the thread and the thread itself
+//> also has a flag to request thread close
 struct thread_struct{
     std::vector<sptr<connection_struct>> owned_connections;
     uptr<std::thread> thread;
     std::atomic<bool> request_close = false;
 };
+//> handles basic server things like .start() which starts listening for connections and spawns
+//> new threads (via setup_thread) to handle them. Derived classes should implement handle_first_connection()
+//> and may use remove_connection() for operations which span multiple connections
 class Server: public Node
 {
 public:
     ServerSocket server_socket;
 
-    std::mutex connections_mutex;
-    //% must hold connections_mutex to access
+    //> for accepting on the server socket
+    std::mutex accept_mutex;
+    //> for accessing connections, threads
+    std::mutex connections_data_mutex;
+    //> must hold connections_data_mutex to access
     std::unordered_map<connection_info, sptr<connection_struct>> connections;
-    //% must hold connections_mutex to access
+    //> must hold connections_data_mutex to access
     std::unordered_map<std::thread::id, sptr<thread_struct>> threads;
-    //% intended to be used with connections_mutex
+
+    //> used with finished_threads
+    std::mutex finished_threads_mutex;
+    //> not joining with finished threads is UB, so we keep track of them here
+    std::vector<uptr<std::thread>> finished_threads;
+    
+    //> intended to be used with can_exit_cv
+    std::mutex can_exit_mutex;
+    //> used to wait until all threads have exited
     std::condition_variable can_exit_cv;
 
-    Server(socket_address dns_address_, in_port_t port): Node(dns_address_), server_socket(port)
-    {}//server_socket constructor already starts listening
 
+    //> used together with setup_cv to let things that must run after
+    std::mutex setup_mutex;
+    std::condition_variable setup_cv;
+
+    Server(socket_address dns_address_, in_port_t port): Node(dns_address_), server_socket(port){
+        //> lock setup_mutex, unlock at start
+        setup_mutex.lock();
+    }//server_socket constructor already starts listening
+    void cleanup_finished_threads(){
+        std::lock_guard<std::mutex> lock(finished_threads_mutex);
+        for(auto &thread: finished_threads){
+            thread->join();
+        }
+        finished_threads.clear();
+    }
     void start() {
+        setup_mutex.unlock();//> let e.g. _setup_master run
         while (true)
         {
-            // OpenSocket open_socket(SERVER);
+            //> every loop check and clean up finished threads
+            cleanup_finished_threads();
+
             uptr<OpenSocket> open_socket = std::make_unique<OpenSocket>(SERVER);
-            continue_on_err(open_socket->accept_connection(server_socket.get_socket_fd()));
+
+            {//> avoid accepting with multiple threads at once
+                std::lock_guard<std::mutex> lock(accept_mutex);
+                continue_on_err(open_socket->accept_connection(server_socket.get_socket_fd()));
+            }
             
             connection_info connection_info(open_socket->local_address, open_socket->other_address);
             sptr<connection_struct> connection = std::make_shared<connection_struct>();
             connection->open_socket = std::move(open_socket);
             connection->connection_info = connection_info;
-            {
-                std::lock_guard<std::mutex> lock(connections_mutex);
+            {//> use connections_data_mutex because we are modifying connections and threads
+                std::lock_guard<std::mutex> lock(connections_data_mutex);
                 connections[connection_info] = connection;
                 //% below makes a copy of sptr connection
                 uptr<std::thread> thread = 
@@ -91,35 +129,56 @@ public:
     //! does not remove the connection from the thread's owned_connections
     //* use _remove_connection_no_lock if you already have the lock or removing multiple connections
     void remove_connection(connection_info connection_info){
-        std::lock_guard<std::mutex> lock(connections_mutex);
+        std::lock_guard<std::mutex> lock(connections_data_mutex);
         _remove_connection_no_lock(connection_info);
     }
     //! should only be called from the thread being removed
+    //> first removes all owned connections, then removes the thread
     void remove_thread(std::thread::id thread_id){
-        std::lock_guard<std::mutex> lock(connections_mutex);
-        throw_if(not_in(thread_id, threads), "Thread not found in threads map");
-        
-        sptr<thread_struct> this_thread = threads[thread_id];
-        for(auto &connection: this_thread->owned_connections){
-            _remove_connection_no_lock(connection->connection_info);
-            throw_if(connection.use_count() != 1,
-            "Connection still has other owners "+std::to_string(connection.use_count()));
+        sptr<thread_struct> this_thread;
+        {
+            std::lock_guard<std::mutex> lock(connections_data_mutex);
+            throw_if(not_in(thread_id, threads), "Thread not found in threads map");
+            
+            sptr<thread_struct> this_thread = threads[thread_id];
+            for(auto &connection: this_thread->owned_connections){
+                _remove_connection_no_lock(connection->connection_info);
+                throw_if(connection.use_count() != 1,
+                "Connection still has other owners "+std::to_string(connection.use_count()));
+            }
+
+            this_thread->owned_connections.clear();
+            threads.erase(thread_id);
         }
-        this_thread->owned_connections.clear();
-        threads.erase(thread_id);
         throw_if(this_thread.use_count() != 1,
         "Thread still has other owners: "+std::to_string(this_thread.use_count()));
-        this_thread.reset();
+        
+        //> move the thread to finished_threads
+        {
+            std::lock_guard<std::mutex> lock(finished_threads_mutex);
+            finished_threads.push_back(std::move(this_thread->thread));
+        }
+        
+        this_thread.reset();//> release the last ref of the struct
         can_exit_cv.notify_all();
     }
-    //%notice that connection is not a reference to the sptr, it is a new sptr
-    //*after handle_first_connection, the only owner of this_thread should be this function so it can safely delete itself
+
+    //% notice that connection is not a reference to the sptr, it is a new sptr
+    //* after handle_first_connection, the only owner of this_thread should be this function so it can safely delete itself
+    //> Note: this already initializes the recv, meaning that the first message should always be sent by the client
     void setup_thread(connection_info connection_info, sptr<connection_struct> connection){
         std::thread::id this_thread_id = std::this_thread::get_id();
         sptr<thread_struct> this_thread;
+
+        //> makes it safe in case of a throw or early return, the thread will still be removed
+        OnDelete on_delete_thread([&this_thread,this_thread_id, this](){
+            this_thread.reset();
+            remove_thread(this_thread_id);
+        });
+
         {
             //lock to let the creator finish setting the thread into the map
-            std::lock_guard<std::mutex> lock(connections_mutex);
+            std::lock_guard<std::mutex> lock(connections_data_mutex);
             throw_if(not_in(this_thread_id, threads), "Thread not found in threads map");
             this_thread = threads[this_thread_id];//minor optimization could be to not discard not_in result
             throw_if(not_in(connection_info, connections), "Connection not found in connections map");
@@ -136,27 +195,29 @@ public:
         //* check definition of THROW_IF_RECOVERABLE
         //> also, tl->initialize_recv initializes the receive of the message, meaning that every connection from
         //> client -> server should always send a message from the client first
-        THROW_IF_RECOVERABLE(tl->initialize_recv(), "Failed to initialize recv", 
-            {
-                //release this_thread
-                this_thread.reset();
-                remove_thread(this_thread_id); 
-                return;
-            }
-        );
-        
+        THROW_IF_RECOVERABLE(tl->initialize_recv(), "Failed to initialize recv", return;);
+
         handle_first_connection(this_thread);
-        //* dont forget to clean up
-        this_thread.reset();
-        remove_thread(this_thread_id);
     }
+
     //> returning from this function will cause the thread to exit and close any owned connections
     virtual void handle_first_connection(sptr<thread_struct> this_thread) = 0;
+
     ~Server(){
-        can_exit_cv.notify_all();
+        {//> notify every thread to exit
+            std::lock_guard<std::mutex> lock(connections_data_mutex);
+            for(auto &thread: threads){
+                thread.second->request_close = true;
+            }
+        }
+        //> wait for all threads to exit
+        std::unique_lock<std::mutex> lock(can_exit_mutex);
+        can_exit_cv.wait(lock, [this](){return threads.empty();});
+        //> join with all finished threads
+        cleanup_finished_threads();
     }
 };
-//MASTER/MASTER_BACKUP/DATA
+//> MASTER/MASTER_BACKUP/DATA
 enum node_role{
     MASTER,
     MASTER_BACKUP,
@@ -187,26 +248,29 @@ enum REQUEST : u8
     DOWNLOAD,
     UPLOAD
 };
+//> append at the end of messages to communicate the dialogue status
+//> Note: initially the client owns the dialogue, so the first message should be from the client
+//> END_IMMEDIATELY/YOUR_TURN/ANOTHER_MESSAGE
+enum DIALOGUE_STATUS : u8
+{
+    //> END IMMEDIATELY should be used after receiving YOUR_TURN if no more messages should be sent
+    //> also can put a END_IMMEDIATELY on the first message if no reply is expected
+    END_IMMEDIATELY=0b00000000,
+    //> YOUR_TURN gives control over the dialogue to the other side
+    YOUR_TURN=0b00001111,
+    //> ANOTHER_MESSAGE means that the owning side sends another message
+    ANOTHER_MESSAGE=0b11111111
+};
+
 static_assert(sizeof(PACKET_ID) == 1, "Packet ID must be 1 byte");
 static_assert(sizeof(REQUEST) == 1, "Request must be 1 byte");
+
 
 // ================================================================
 
 //% all below true if error
 //> for a simple type like PACKET_ID just use read_type and write_type
-// [[nodiscard]]
-// inline bool read_packet_id(TransmissionLayer &tl, PACKET_ID &packet_id)
-// {
-//     u8 byte;
-//     bool err=tl.read_byte(byte);
-//     packet_id = static_cast<PACKET_ID>(byte);
-//     return err;
-// }
-// [[nodiscard]]
-// bool write_packet_id(TransmissionLayer &tl, PACKET_ID packet_id)
-// {
-//     return tl.write_byte(static_cast<u8>(packet_id));
-// }
+
 [[nodiscard]]
 bool read_address(TransmissionLayer &tl, socket_address &addr)
 {
@@ -221,8 +285,64 @@ bool write_address(TransmissionLayer &tl, socket_address addr)
 {
     return tl.write_type(addr.ip.to_u32())||tl.write_type(addr.port);
 }
+//! does not support vectors longer than 2^31-1
+//> stores a i32 size and then each element using read_type
+template<typename T>
+[[nodiscard]]
+bool read_vector(TransmissionLayer &tl, std::vector<T> &vec)
+{
+    i32 size;
+    if(tl.read_type(size)) return true;
+    vec.resize(size);
+    for(auto &elem: vec){
+        if(tl.read_type(elem)) return true;
+    }
+    return false;
+}
+//! does not support vectors longer than 2^31-1
+//> reads a i32 size and then each element using write_type
+template<typename T>
+[[nodiscard]]
+bool write_vector(TransmissionLayer &tl, std::vector<T> &vec)
+{
+    if(tl.write_type(static_cast<i32>(vec.size()))) return true;
+    for(auto &elem: vec){
+        if(tl.write_type(elem)) return true;
+    }
+    return false;
+}
+//! does not support vectors longer than 2^31-1
+//> stores a i32 size and then each element using read_f
+//~ read_f(&tl, &vec_elem) should be bool and return true if error
+template<typename T, typename F>
+[[nodiscard]]
+bool read_vector_custom(TransmissionLayer &tl, std::vector<T> &vec, F read_f)
+{
+    i32 size;
+    if(tl.read_type(size)) return true;
+    vec.resize(size);
+    for(auto &elem: vec){
+        if(read_f(tl, elem)) return true;
+    }
+    return false;
+}
+//! does not support vectors longer than 2^31-1
+//> reads a i32 size and then each element using write_f
+//~ write_f(&tl, &vec_elem) should be bool and return true if error
+template<typename T, typename F>
+[[nodiscard]]
+bool write_vector_custom(TransmissionLayer &tl, std::vector<T> &vec, F write_f)
+{
+    if(tl.write_type(static_cast<i32>(vec.size()))) return true;
+    for(auto &elem: vec){
+        if(write_f(tl, elem)) return true;
+    }
+    return false;
+}
 
 // ================================================================
+//> DNS server, supposed to never fail
+//> Client asks for the master node address here, and a restored backup node asks for list of all nodes
 class DNS : public Server
 {
 public:
@@ -233,61 +353,205 @@ public:
     std::unordered_set<socket_address> nodes;
 
     void handle_first_connection(sptr<thread_struct> this_thread) override {
-        //> first, read the packet id
-        PACKET_ID packet_id;
-        THROW_IF_RECOVERABLE(
-            read_packet_id(*this_thread->owned_connections.back()->tl, packet_id), "Failed to read packet id", return;);
-        switch (packet_id){
-
+        // bool this_side_owns_connection = false; //> irrelevant because other side always owns connection with DNS
+        while(true){
+            //> first, read the packet id
+            PACKET_ID packet_id;
+            THROW_IF_RECOVERABLE(this_thread->owned_connections.empty(), "No connections", return;);
+            {//> make a new scope to not hold onto the &tl after the connection is supposed to be closed
+                TransmissionLayer &tl = *this_thread->owned_connections.back()->tl;
+                THROW_IF_RECOVERABLE(tl.read_type(packet_id),"Failed to read packet id",return;);
+                //> only handle the -> dns ids
+                switch (packet_id){
+                    case REQUEST_MASTER_ADDRESS:
+                        handle_request_master_address(tl);
+                        break;
+                    case SET_MASTER_ADDRESS:
+                        handle_set_master_address(tl);
+                        break;
+                    case REQUEST_LIST_OF_ALL_NODES:
+                        handle_request_list_of_all_nodes(tl);
+                        break;
+                    case EDIT_LIST_OF_ALL_NODES:
+                        handle_edit_list_of_all_nodes(tl);
+                        break;
+                    default:
+                        THROW_IF_RECOVERABLE(true, "Invalid packet id:"+std::to_string(packet_id), return;);
+                }
+                DIALOGUE_STATUS dialogue_status;
+                THROW_IF_RECOVERABLE(tl.read_type(dialogue_status), "Failed to read dialogue status", return;);
+                if(dialogue_status==END_IMMEDIATELY){
+                    return;
+                }else if(dialogue_status==YOUR_TURN){
+                    THROW_IF_RECOVERABLE(tl.write_type(END_IMMEDIATELY), "Failed to write dialogue status", return;);
+                    THROW_IF_RECOVERABLE(tl.finalize_send(), "Failed to send dialogue status", return;);
+                    return;
+                }else if(dialogue_status!=ANOTHER_MESSAGE){
+                    THROW_IF_RECOVERABLE(true, "Invalid dialogue status:"+std::to_string(dialogue_status), return;);
+                }//else continue the dialogue
+            }
         }
     }
-
+    void handle_request_master_address(TransmissionLayer &tl){
+        socket_address addr;
+        {//> grab the master addr safely
+            std::lock_guard<std::mutex> lock(mutexDNS);
+            THROW_IF_RECOVERABLE(addrCurMaster.is_unset(), "No master address set", return;);
+            addr = addrCurMaster;
+        }
+        THROW_IF_RECOVERABLE(write_address(tl, addr), "Failed to write address", return;);
+        THROW_IF_RECOVERABLE(tl.finalize_send(), "Failed to send address", return;);
+    }
+    void handle_set_master_address(TransmissionLayer &tl){
+        socket_address addr;
+        THROW_IF_RECOVERABLE(read_address(tl, addr), "Failed to read address", return;);
+        {//> set the master addr safely
+            std::lock_guard<std::mutex> lock(mutexDNS);
+            addrCurMaster = addr;
+        }
+    }
+    void handle_request_list_of_all_nodes(TransmissionLayer &tl){
+        std::vector<socket_address> vec;
+        {//> grab the nodes safely
+            std::lock_guard<std::mutex> lock(mutexDNS);
+            THROW_IF_RECOVERABLE(nodes.empty(), "No nodes set on DNS request", return;);
+            vec.assign(nodes.begin(), nodes.end());
+        }
+        THROW_IF_RECOVERABLE(write_vector_custom(tl, vec, write_address), "Failed to write addresses", return;);
+        THROW_IF_RECOVERABLE(tl.finalize_send(), "Failed to send addresses", return;);
+    }
+    void handle_edit_list_of_all_nodes(TransmissionLayer &tl){
+        std::vector<socket_address> vec;
+        THROW_IF_RECOVERABLE(read_vector_custom(tl, vec, read_address), "Failed to read addresses", return;);
+        {//> set the nodes safely
+            std::lock_guard<std::mutex> lock(mutexDNS);
+            nodes.clear();
+            nodes.insert(vec.begin(), vec.end());
+        }
+    }
 };
 // ================================================================
+//> DEFAULT/RETRY/PAUSED
+enum pause_state{
+    //> normal state
+    DEFAULT,
+    //> same as normal state but set by master if before was PAUSED
+    //> after successful connection, set back to DEFAULT
+    RETRY,
+    //> set to this state after a failed connection
+    //> also master sets this state if it wants to pause the connection
+    PAUSED
+};
 class DataNode: public Server
 {
 public:
-    node_role role;
-    in_port_t port; // the exposed port the node is always listening on
 
+    //> common m for all variables below, regardless of role
     std::mutex m;
-    std::condition_variable cv;
-
+    //> role of the node
+    node_role role;
+    //> address of master to check every time
     socket_address addrMaster;
-    bool isAddrMasterReady = false;
 
-    std::vector<std::string> files;
-    std::unordered_set<int> used_fds;
+    //data node specific
+    //> if the outgoing connections to master are paused on the cv
+    pause_state paused = DEFAULT;
+    //> cv to pause the *outgoing* connections to master
+    std::condition_variable paused_cv;
+    //> to be used with cv, returns paused!=PAUSED
+    bool should_connect() const { return paused != PAUSED; }
+    //> whether this node is the backup node, and so should rise to master if master fails
+    bool is_backup = false;
+    //> map from file name to version (also used as unordered set for filenames)
+    std::unordered_map<std::string, i64> own_files;
 
+
+    //master specific
+    //> map from file name to list of data nodes
+    std::unordered_map<std::string, std::vector<socket_address>> file_to_nodes;
+    //> map from data node to list of files
+    std::unordered_map<socket_address, std::vector<std::string>> node_to_files;
+    //> which node is the backup node
+    socket_address backup_node;
+
+    //> NOTE: even if role is master, nodes should still contain itself, otherwise it will not be used as a data node
     DataNode(socket_address dns_address_, in_port_t port, node_role initial_role):
-    Server(dns_address_, port), port(port), role(initial_role){}
+    Server(dns_address_, port), role(initial_role){}
 
-    void start(){
-        std::thread listenThread(&DataNode::listen, this);
-        std::thread consumeThread(&DataNode::consume, this);
-        std::thread miscThread(&DataNode::doMiscTasks, this);
-
-        miscThread.join();
-        listenThread.join();
-        consumeThread.join();
+    //> should be called before start()
+    void setup_master_thread(std::vector<socket_address> &nodes_vec){
+        //> create a new thread to set up the master node
+        std::lock_guard<std::mutex> lock(connections_data_mutex);
+        uptr<std::thread> setup_thread=std::make_unique<std::thread>([this, nodes_vec](){
+            _setup_master(nodes_vec);
+        });
+        threads[setup_thread->get_id()] = std::make_shared<thread_struct>();
+        threads[setup_thread->get_id()]->thread = std::move(setup_thread);
     }
-
-    void listen() {
-        while (true)
-        {
-            OpenSocket open_socket(SERVER);
-            open_socket.accept_connection(server_socket.get_socket_fd());
-
-            // Parse incoming stream to packet
-            Packet packet = Packet(open_socket);
-
-            // Add parsed packet to queue
-            std::lock_guard<std::mutex> lockGuard(mutexPackets);
-            packets.push(packet);
-
-            isPacketsReady = true;
-            cv.notify_one();
+    void _setup_master(std::vector<socket_address> nodes_vec){
+        //% notice that none of the below are THROW_IF_RECOVERABLE,
+        //% because it is expected that no failures happen during setup
+        {//> make sure this is run after the server has started
+            std::lock_guard<std::mutex> setup_lock(setup_mutex);
         }
+        std::unique_lock<std::mutex> lock(m);
+        throw_if(role != MASTER, "Only master node can run this function");
+        auto addresses = getIPAddresses();
+        throw_if(addresses.empty(), "No network interfaces found");
+        //> addrMaster has to point to self since master node is also a data node
+        {
+            addrMaster = socket_address(addresses[0], server_socket.get_port());
+            //> setup the nodes hashmap
+            for(auto &node: nodes_vec){
+                node_to_files[node] = {};
+            }
+        }
+        socket_address addrMaster_local = addrMaster;//> avoid accessing the real one without the lock
+        lock.unlock();//> can release now because already modified
+        
+        //> contact the DNS to set the master address
+        {
+            OpenSocket open_socket(CLIENT);
+            //> do not THROW_IF_RECOVERABLE because it is expected that no failures happen during setup
+            throw_if(open_socket.connect_to_server(dns_address), "Failed to connect to DNS");
+            TransmissionLayer tl(open_socket);
+            throw_if(tl.write_type(SET_MASTER_ADDRESS), "Failed to write packet id");
+            throw_if(write_address(tl, addrMaster_local), "Failed to write address");
+            throw_if(tl.write_type(ANOTHER_MESSAGE), "Failed to write dialogue status");
+            throw_if(tl.finalize_send(), "Failed to send address");
+            
+            //> contact the DNS to set the list of nodes
+            throw_if(tl.write_type(EDIT_LIST_OF_ALL_NODES), "Failed to write packet id");
+            throw_if(write_vector_custom(tl, nodes_vec, write_address), "Failed to write addresses");
+            throw_if(tl.write_type(END_IMMEDIATELY), "Failed to write dialogue status");
+            throw_if(tl.finalize_send(), "Failed to send addresses");
+        }
+
+        //> contact each data node to set the master address, and pick one as backup
+
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(0, nodes_vec.size() - 1);
+        int backup_index = dis(gen);
+        
+        lock.lock();//> relock to modify the backup node
+        backup_node = nodes_vec[backup_index];
+        lock.unlock();
+
+        for(auto &node: nodes_vec){
+            OpenSocket open_socket(CLIENT);
+            //> do not THROW_IF_RECOVERABLE because it is expected that no failures happen during setup
+            throw_if(open_socket.connect_to_server(node), "Failed to connect to data node");
+            TransmissionLayer tl(open_socket);
+            throw_if(tl.write_type(SET_MASTER_ADDRESS), "Failed to write packet id");
+            throw_if(write_address(tl, addrMaster_local), "Failed to write address");
+            throw_if(tl.finalize_send(), "Failed to send address");
+            if(node == backup_node){
+                throw_if(tl.write_type(SET_DATA_NODE_AS_BACKUP), "Failed to write packet id");
+                throw_if(tl.finalize_send(), "Failed to send backup request");
+            }
+        }
+
     }
 
     void writeFile(std::string &name, BYTES &data) {
