@@ -17,6 +17,17 @@
 namespace distribsys{
 
 constexpr bool THROW_ON_RECOVERABLE = false;
+//> this is used in the case when we'd like to setup debugging to throw on recoverable errors
+//> otherwise default action is taken, which should should correspond to silently handling the error
+//> also useful because it shows clearly in code that this is an error but recoverable
+#define THROW_IF_RECOVERABLE(x,s,default_action)\
+if(x){\
+    if(THROW_ON_RECOVERABLE){\
+        throw std::runtime_error(s);\
+    }else{\
+        default_action\
+    }\
+}
 
 //client or server
 enum SOCKET_TYPE
@@ -67,14 +78,7 @@ public:
     bool is_valid() const { return allocated_fd.is_valid(); }
 
 
-#define THROW_IF_RECOVERABLE(x,s,default_action)\
-if(x){\
-    if(THROW_ON_RECOVERABLE){\
-        throw std::runtime_error(s);\
-    }else{\
-        default_action\
-    }\
-}
+
 
     i64 num_send = 0;
     i64 num_recv = 0;
@@ -383,6 +387,7 @@ class TransmissionLayer{
         }
         return false;
     }
+    //% all below true if error
     [[nodiscard]]
     bool write_byte(u8 byte){
         return send_if_dont_fit((char*)&byte, 1);
@@ -417,7 +422,7 @@ class TransmissionLayer{
     template<typename T>
     [[nodiscard]]
     bool write_type(const T& val){
-        static_assert(std::is_trivially_copyable<T>::value, "Type must be trivially copyable");
+        static_assert(std::is_trivial<T>::value, "Type must be trivially copyable");
         return write_bytes(reinterpret_cast<const char*>(&val), sizeof(T));
     }
     [[nodiscard]]
@@ -529,6 +534,7 @@ class TransmissionLayer{
         DEBUG_PRINT(prints_new("Received batch: ", batches_received, " with data length: ", recv_batch_len, " and continue: ", recv_batch_continue));
         return false;
     }
+    //% all below true if error
     [[nodiscard]]
     bool read_byte(u8& byte){
         return recv_if_not_enough((char*)&byte, 1);
@@ -563,7 +569,7 @@ class TransmissionLayer{
     template<typename T>
     [[nodiscard]]
     bool read_type(T& val){
-        static_assert(std::is_trivially_copyable<T>::value, "Type must be trivially copyable");
+        static_assert(std::is_trivial<T>::value, "Type must be trivially copyable");
         return read_bytes(reinterpret_cast<char*>(&val), sizeof(T));
     }
     void print_errors() const {

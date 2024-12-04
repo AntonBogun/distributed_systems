@@ -71,18 +71,21 @@ public:
             {
                 std::lock_guard<std::mutex> lock(connections_mutex);
                 connections[connection_info] = connection;
+                //% below makes a copy of sptr connection
                 uptr<std::thread> thread = 
                 std::make_unique<std::thread>(&Server::setup_thread, this, connection_info, connection);
                 threads[thread->get_id()] = std::make_shared<thread_struct>();
                 threads[thread->get_id()]->thread = std::move(thread);
                 connection->owner_thread_id = thread->get_id();
+                //% makes a copy of sptr connection
                 threads[thread->get_id()]->owned_connections.push_back(connection);
+                connection.reset();//% release the connection ref from this scope
             }
         }
     }
     //% do not use without lock, but can chain together without releasing the lock every time
     //! does not remove the connection from the thread's owned_connections
-    void _remove_connection_no_lock(connection_info connection_info){
+    inline void _remove_connection_no_lock(connection_info connection_info){
         connections.erase(connection_info);
     }
     //! does not remove the connection from the thread's owned_connections
@@ -127,7 +130,12 @@ public:
         }
         uptr<TransmissionLayer> tl = std::make_unique<TransmissionLayer>(*connection->open_socket);
         connection->tl = std::move(tl);
-        //check definition of THROW_IF_RECOVERABLE
+        connection.reset();//release the connection ref from this scope
+        
+        //% used to handle if recv failed here, effectively the connection wasn't established
+        //* check definition of THROW_IF_RECOVERABLE
+        //> also, tl->initialize_recv initializes the receive of the message, meaning that every connection from
+        //> client -> server should always send a message from the client first
         THROW_IF_RECOVERABLE(tl->initialize_recv(), "Failed to initialize recv", 
             {
                 //release this_thread
@@ -136,9 +144,13 @@ public:
                 return;
             }
         );
-        handle_first_connection(this_thread);
         
+        handle_first_connection(this_thread);
+        //* dont forget to clean up
+        this_thread.reset();
+        remove_thread(this_thread_id);
     }
+    //> returning from this function will cause the thread to exit and close any owned connections
     virtual void handle_first_connection(sptr<thread_struct> this_thread) = 0;
     ~Server(){
         can_exit_cv.notify_all();
@@ -179,46 +191,54 @@ static_assert(sizeof(PACKET_ID) == 1, "Packet ID must be 1 byte");
 static_assert(sizeof(REQUEST) == 1, "Request must be 1 byte");
 
 // ================================================================
+
+//% all below true if error
+//> for a simple type like PACKET_ID just use read_type and write_type
+// [[nodiscard]]
+// inline bool read_packet_id(TransmissionLayer &tl, PACKET_ID &packet_id)
+// {
+//     u8 byte;
+//     bool err=tl.read_byte(byte);
+//     packet_id = static_cast<PACKET_ID>(byte);
+//     return err;
+// }
+// [[nodiscard]]
+// bool write_packet_id(TransmissionLayer &tl, PACKET_ID packet_id)
+// {
+//     return tl.write_byte(static_cast<u8>(packet_id));
+// }
+[[nodiscard]]
+bool read_address(TransmissionLayer &tl, socket_address &addr)
+{
+    u32 ip;
+    in_port_t port;
+    if(tl.read_type(ip)||tl.read_type(port)) return true;
+    addr = socket_address(ipv4_addr::from_u32(ip), port);
+    return false;
+}
+[[nodiscard]]
+bool write_address(TransmissionLayer &tl, socket_address addr)
+{
+    return tl.write_type(addr.ip.to_u32())||tl.write_type(addr.port);
+}
+
+// ================================================================
 class DNS : public Server
 {
 public:
     DNS():Server(socket_address(0,0,0,0,0), DNS_PORT){}
+
+    std::mutex mutexDNS;//* controls the below two variables
     socket_address addrCurMaster;
     std::unordered_set<socket_address> nodes;
-    std::mutex mutexNodes;
 
-    void handle_connection(sptr<thread_struct> this_thread) override {
-        OpenSocket &open_socket = *connection->open_socket;
-        while (true)
-        {
-            Packet packet = Packet(open_socket);
-            switch (packet.packetID)
-            {
-                case REQUEST_MASTER_ADDRESS:
-                {
-                    Packet packetResponse = Packet::compose_RESPONSE_NODE_IP(addrCurMaster);
-                    packetResponse.send(open_socket.other_address);
-                    break;
-                }
-                case SET_MASTER_ADDRESS:
-                {
-                    addrCurMaster = packet.addrParsed;
-                    break;
-                }
-                case REQUEST_LIST_OF_ALL_NODES:
-                {
-                    std::lock_guard<std::mutex> lock(mutexNodes);
-                    Packet packetResponse = Packet::compose_RESPONSE_LIST_OF_NODES(nodes);
-                    packetResponse.send(open_socket.other_address);
-                    break;
-                }
-                case EDIT_LIST_OF_ALL_NODES:
-                {
-                    std::lock_guard<std::mutex> lock(mutexNodes);
-                    nodes = packet.nodes;
-                    break;
-                }
-            }
+    void handle_first_connection(sptr<thread_struct> this_thread) override {
+        //> first, read the packet id
+        PACKET_ID packet_id;
+        THROW_IF_RECOVERABLE(
+            read_packet_id(*this_thread->owned_connections.back()->tl, packet_id), "Failed to read packet id", return;);
+        switch (packet_id){
+
         }
     }
 

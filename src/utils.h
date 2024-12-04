@@ -482,6 +482,15 @@ template <typename V, typename T>
 inline bool not_in(const T& val, const V& container){
     return container.find(val)==container.end();
 }
+template<typename f_type>
+class OnDelete {
+    f_type f;
+public:
+    OnDelete(f_type f) : f(f) {}
+    ~OnDelete() {
+        f();
+    }
+};
 
 template<typename T, typename... Args>
 void prints(std::stringstream &ss, T arg, Args&&... args) {

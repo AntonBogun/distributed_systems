@@ -46,6 +46,14 @@ struct ipv4_addr
     u32 to_u32() const {
         return a | (b << 8) | (c << 16) | (d << 24);
     }
+    static ipv4_addr from_u32(u32 val){
+        ipv4_addr ip;
+        ip.a = val & 0xFF;
+        ip.b = (val >> 8) & 0xFF;
+        ip.c = (val >> 16) & 0xFF;
+        ip.d = (val >> 24) & 0xFF;
+        return ip;
+    }
     bool operator==(ipv4_addr other) const
     {
         return a == other.a && b == other.b && c == other.c && d == other.d;
