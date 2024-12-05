@@ -22,6 +22,8 @@ namespace distribsys{
     std::atomic<bool> _do_verbose = false;
     std::mutex _mutex_logging;
     std::mutex ifaddrs_mutex;
+    const TimeValue HEARTBEAT_INTERVAL = 0.5;
+    const int MAX_HEARTBEAT_RETRIES = 2;
 }
 
 using namespace distribsys;

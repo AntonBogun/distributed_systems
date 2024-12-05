@@ -37,6 +37,7 @@ namespace distribsys{
     #else
     #define DEBUG_PRINT(x)
     #endif
+    #define LINE_LOCATION " in " + __FILE__ + " at " + std::to_string(__LINE__)
 
 
 

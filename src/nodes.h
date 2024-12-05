@@ -1,6 +1,7 @@
 #pragma once
 #include "transmission.h"
 #include "packets.h"
+#include "logging.h"
 
 #include <condition_variable>
 #include <iostream>
@@ -162,22 +163,27 @@ public:
         this_thread.reset();//> release the last ref of the struct
         can_exit_cv.notify_all();
     }
+    //> out of scope of this project
+    // template<typename Func>
+    // void AutoCloseThreadTemplate(Func func, sptr<std::mutex> setup_mutex){
+    // }
 
     //% notice that connection is not a reference to the sptr, it is a new sptr
     //* after handle_first_connection, the only owner of this_thread should be this function so it can safely delete itself
     //> Note: this already initializes the recv, meaning that the first message should always be sent by the client
     void setup_thread(connection_info connection_info, sptr<connection_struct> connection){
+        {//> wait until setup completes
+            std::lock_guard<std::mutex> lock(connections_data_mutex);   
+        }
         std::thread::id this_thread_id = std::this_thread::get_id();
         sptr<thread_struct> this_thread;
-
         //> makes it safe in case of a throw or early return, the thread will still be removed
         OnDelete on_delete_thread([&this_thread,this_thread_id, this](){
             this_thread.reset();
             remove_thread(this_thread_id);
         });
 
-        {
-            //lock to let the creator finish setting the thread into the map
+        {//> check consistency and get this_thread
             std::lock_guard<std::mutex> lock(connections_data_mutex);
             throw_if(not_in(this_thread_id, threads), "Thread not found in threads map");
             this_thread = threads[this_thread_id];//minor optimization could be to not discard not_in result
@@ -229,17 +235,18 @@ enum node_role{
 enum PACKET_ID : u8
 {
     REQUEST_OPEN_HEARTBEAT_CONNECTION=0, // master -> data nodes
-    REQUEST_MASTER_ADDRESS=1,            // client -> dns
-    SET_MASTER_ADDRESS=2,                // master -> both dns and data nodes
-    REQUEST_LIST_OF_ALL_NODES=3,         // master -> dns
-    EDIT_LIST_OF_ALL_NODES=4,            // master -> dns
-    SET_DATA_NODE_AS_BACKUP=5,           // master -> data node
-    CLIENT_CONNECTION_REQUEST=6,         // client -> both to master and data nodes
-    DATA_NODE_TO_MASTER_CONNECTION_REQUEST=7, // data node -> master
-    MASTER_NODE_TO_DATA_NODE_REPLICATION_REQUEST=8, // master -> data node
-    DATA_NODE_TO_DATA_NODE_CONNECTION_REQUEST=9, // data node -> data node
-    MASTER_TO_DATA_NODE_INFO_REQUEST=10,  // master -> data node
-    MASTER_TO_DATA_NODE_PAUSE_CHANGE=11   // master -> data node
+    HEARTBEAT_CONTINUE=1, // master -> data nodes
+    REQUEST_MASTER_ADDRESS=2,            // client -> dns
+    SET_MASTER_ADDRESS=3,                // master -> both dns and data nodes
+    REQUEST_LIST_OF_ALL_NODES=4,         // master -> dns
+    EDIT_LIST_OF_ALL_NODES=5,            // master -> dns
+    SET_DATA_NODE_AS_BACKUP=6,           // master -> data node
+    CLIENT_CONNECTION_REQUEST=7,         // client -> both to master and data nodes
+    DATA_NODE_TO_MASTER_CONNECTION_REQUEST=8, // data node -> master
+    MASTER_NODE_TO_DATA_NODE_REPLICATION_REQUEST=9, // master -> data node
+    DATA_NODE_TO_DATA_NODE_CONNECTION_REQUEST=10, // data node -> data node
+    MASTER_TO_DATA_NODE_INFO_REQUEST=11,  // master -> data node
+    MASTER_TO_DATA_NODE_PAUSE_CHANGE=12   // master -> data node
 };
 
 
@@ -264,6 +271,8 @@ enum DIALOGUE_STATUS : u8
 
 static_assert(sizeof(PACKET_ID) == 1, "Packet ID must be 1 byte");
 static_assert(sizeof(REQUEST) == 1, "Request must be 1 byte");
+
+extern const TimeValue HEARTBEAT_INTERVAL;//> 2/s
 
 
 // ================================================================
@@ -442,6 +451,17 @@ enum pause_state{
     //> also master sets this state if it wants to pause the connection
     PAUSED
 };
+struct file_info{
+    int num_readers = 0;
+    int num_writers = 0;
+    bool not_write_blocked() const { return num_readers == 0 && num_writers == 0; }
+    bool not_read_blocked() const { return num_writers == 0; }
+    std::unordered_set<socket_address> replicas;
+    // i64 version; //> irrelevant to consistently keep track of version from master
+};
+struct node_info{
+    std::unordered_set<std::string> files;
+};
 class DataNode: public Server
 {
 public:
@@ -468,9 +488,9 @@ public:
 
     //master specific
     //> map from file name to list of data nodes
-    std::unordered_map<std::string, std::vector<socket_address>> file_to_nodes;
+    std::unordered_map<std::string, std::vector<socket_address>> file_to_info;
     //> map from data node to list of files
-    std::unordered_map<socket_address, std::vector<std::string>> node_to_files;
+    std::unordered_map<socket_address, std::vector<std::string>> node_to_info;
     //> which node is the backup node
     socket_address backup_node;
 
@@ -503,7 +523,7 @@ public:
             addrMaster = socket_address(addresses[0], server_socket.get_port());
             //> setup the nodes hashmap
             for(auto &node: nodes_vec){
-                node_to_files[node] = {};
+                node_to_info[node] = {};
             }
         }
         socket_address addrMaster_local = addrMaster;//> avoid accessing the real one without the lock
@@ -531,8 +551,25 @@ public:
 
         std::random_device rd;
         std::mt19937 gen(rd());
-        std::uniform_int_distribution<> dis(0, nodes_vec.size() - 1);
-        int backup_index = dis(gen);
+        std::uniform_int_distribution<> dis;
+        //% have to avoid setting master node to backup node for obvious reasons
+        int backup_index;
+        {
+            int same_pos=-1;
+            for(int i=0; i<nodes_vec.size(); i++){
+                if(nodes_vec[i] == addrMaster_local){
+                    same_pos = i;
+                    break;
+                }
+            }
+            //> -1 from number of nodes if master is in the list
+            dis = std::uniform_int_distribution<>(0, nodes_vec.size()-bool(same_pos>=0)-1);
+            backup_index = dis(gen);
+            if(same_pos>=0 && backup_index>=same_pos){
+                //>makes distribution skip over the master node
+                backup_index++;
+            }
+        }
         
         lock.lock();//> relock to modify the backup node
         backup_node = nodes_vec[backup_index];
@@ -545,13 +582,110 @@ public:
             TransmissionLayer tl(open_socket);
             throw_if(tl.write_type(SET_MASTER_ADDRESS), "Failed to write packet id");
             throw_if(write_address(tl, addrMaster_local), "Failed to write address");
-            throw_if(tl.finalize_send(), "Failed to send address");
-            if(node == backup_node){
+            if(node == nodes_vec[backup_index]){
+                throw_if(tl.write_type(ANOTHER_MESSAGE), "Failed to write dialogue status");
+                throw_if(tl.finalize_send(), "Failed to send address");
                 throw_if(tl.write_type(SET_DATA_NODE_AS_BACKUP), "Failed to write packet id");
+                throw_if(tl.write_type(END_IMMEDIATELY), "Failed to write dialogue status");
                 throw_if(tl.finalize_send(), "Failed to send backup request");
+            }else{
+                throw_if(tl.write_type(END_IMMEDIATELY), "Failed to write dialogue status");
+                throw_if(tl.finalize_send(), "Failed to send address");
             }
         }
+        //> set heartbeat with each one except for itself
+        for(auto &node: nodes_vec){
+            if(node == addrMaster_local) continue;
+            //> standard pass procedure
+            //===
+            std::lock_guard<std::mutex> lock(connections_data_mutex);
+            uptr<std::thread> heartbeat_thread = std::make_unique<std::thread>(&DataNode::_setup_heartbeat, this, node);
+            threads[heartbeat_thread->get_id()] = std::make_shared<thread_struct>();
+            threads[heartbeat_thread->get_id()]->thread = std::move(heartbeat_thread);
+            //===
+        }
 
+    }
+    void _setup_heartbeat(socket_address addr){
+        {//> wait until got setup
+            std::lock_guard<std::mutex> lock(connections_data_mutex);
+        }
+        std::thread::id this_thread_id = std::this_thread::get_id();
+        sptr<thread_struct> this_thread;
+        //> makes it safe in case of a throw or early return, the thread will still be removed
+        OnDelete on_delete_thread([&this_thread,this_thread_id, this](){
+            this_thread.reset();
+            remove_thread(this_thread_id);
+        });
+
+        {//> check consistency and get this_thread
+            std::lock_guard<std::mutex> lock(connections_data_mutex);
+            throw_if(not_in(this_thread_id, threads), "Thread not found in threads map");
+            this_thread = threads[this_thread_id];
+        }
+        //> need loop to be able to break on error and also retry
+        bool error = false;
+        for(int i=0; i<MAX_HEARTBEAT_RETRIES; i++){
+            //> check if should exit
+            {
+                if(this_thread->request_close.load()){
+                    debug_log(std::string("Thread requested close") + LINE_LOCATION);
+                    return;
+                }
+            }
+            error = false;
+            //> standard outgoing socket creation procedure
+            //===
+            uptr<OpenSocket> open_socket = std::make_unique<OpenSocket>(CLIENT);
+            THROW_IF_RECOVERABLE(open_socket->connect_to_server(addr), "Failed to connect to data node", 
+            {error = true;break;});
+            connection_info connection_info(open_socket->local_address, open_socket->other_address);
+            sptr<connection_struct> connection = std::make_shared<connection_struct>();
+            connection->open_socket = std::move(open_socket);
+            connection->connection_info = connection_info;
+            {//> use connections_data_mutex because we are modifying connections and threads
+                std::lock_guard<std::mutex> lock(connections_data_mutex);
+                connections[connection_info] = connection;
+                connection->owner_thread_id = this_thread_id;
+                //% makes a copy of sptr connection
+                this_thread->owned_connections.push_back(connection);
+                //> do not release local connection since we use it immediately after
+            }
+            uptr<TransmissionLayer> _tl = std::make_unique<TransmissionLayer>(*connection->open_socket);
+            connection->tl = std::move(_tl);
+            //> no need for any further tl initialization since we are sending rather than receiving 
+            //===
+            OnDelete on_delete_connection([&connection, connection_info, this](){
+                connection.reset();//> release the connection ref from this scope
+                remove_connection(connection_info);
+            });
+            TransmissionLayer &tl = *connection->tl;
+            bool own_connection=true;//> since we are the client
+            THROW_IF_RECOVERABLE(tl.write_type(REQUEST_OPEN_HEARTBEAT_CONNECTION), "Failed to write packet id",
+            {error = true;continue;});
+            THROW_IF_RECOVERABLE(tl.write_type(YOUR_TURN), "Failed to write dialogue status",
+            {error = true;continue;});
+            THROW_IF_RECOVERABLE(tl.finalize_send(), "Failed to send heartbeat request",
+            {error = true;continue;});
+            own_connection = false;//> now the server owns the connection
+            while(true){
+                if(this_thread->request_close.load()){
+                    debug_log(std::string("Thread requested close") + LINE_LOCATION);
+                    return;
+                }
+                THROW_IF_RECOVERABLE(tl.initialize_recv(), "Failed to initialize recv", {error = true; break;});
+
+            }
+        }
+        _handle_heartbeat_error(addr);
+    }
+    void _handle_heartbeat_error(socket_address addr){
+        std::lock_guard<std::mutex> lock(m);
+        throw_if(role != MASTER, "Only master node can run this function");
+        auto it = node_to_info.find(addr);
+        throw_if(it == node_to_info.end(), "Node not found in node_to_info");
+        //> remove the node from the list
+        node_to_info.erase(it);
     }
 
     void writeFile(std::string &name, BYTES &data) {

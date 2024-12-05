@@ -482,6 +482,20 @@ template <typename V, typename T>
 inline bool not_in(const T& val, const V& container){
     return container.find(val)==container.end();
 }
+template <typename V, typename T>
+inline bool in_vec(const T& val, const V& vec){
+    return std::find(vec.begin(), vec.end(), val) != vec.end();
+}
+template <typename V, typename T>
+inline i64 index_of(const T& val, const V& vec){
+    for(i64 i=0; i<vec.size(); i++){
+        if(vec[i]==val){
+            return i;
+        }
+    }
+    return -1;
+}
+
 template<typename f_type>
 class OnDelete {
     f_type f;
