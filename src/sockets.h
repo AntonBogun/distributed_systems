@@ -334,7 +334,7 @@ struct TimeValue
         ss << buffer << "." << std::setfill('0') << std::setw(6) << tv.tv_usec;
         return ss.str();
     }
-    TimeValue operator+(TimeValue other)
+    TimeValue operator+(TimeValue other) const
     {
         return TimeValue(time + other.time);
     }
@@ -343,7 +343,7 @@ struct TimeValue
         time += other.time;
         return *this;
     }
-    TimeValue operator-(TimeValue other)
+    TimeValue operator-(TimeValue other) const
     {
         return TimeValue(time - other.time);
     }
@@ -352,11 +352,11 @@ struct TimeValue
         time -= other.time;
         return *this;
     }
-    TimeValue operator*(double other)
+    TimeValue operator*(double other) const
     {
         return TimeValue(time * other);
     }
-    TimeValue operator/(double other)
+    TimeValue operator/(double other) const
     {
         return TimeValue(time / other);
     }
@@ -381,6 +381,10 @@ struct TimeValue
     bool is_near(TimeValue other, double epsilon = 1e-6) const
     {
         return std::abs(time - other.time) < epsilon;
+    }
+    std::chrono::duration<double> to_duration() const
+    {
+        return std::chrono::duration<double>(time);
     }
     // bool operator==(TimeValue other){
     //     return time==other.time;
