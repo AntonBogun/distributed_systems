@@ -76,8 +76,9 @@ public:
     FCVector<char> out_buffer;
 
     file_descriptor allocated_fd; // file descriptor associated with socket
-    socket_address local_address;
-    socket_address other_address;
+    // socket_address local_address;
+    // socket_address other_address;
+    connection_info ci;
     SOCKET_TYPE sock_type;
 
     bool is_valid() const { return allocated_fd.is_valid(); }
@@ -109,7 +110,7 @@ public:
         TimeValue start = TimeValue::now();
         while(true){//wait for connection
             // allocated_fd = accept(server_fd, (struct sockaddr *)&client_address, (socklen_t *)&addrlen);
-            allocated_fd = server_fd.accept_connection(other_address);
+            allocated_fd = server_fd.accept_connection(ci.external_address);
             if(!allocated_fd.is_valid()){
                 if(errno==EINTR||errno==EAGAIN||errno==EWOULDBLOCK){
                     if(!timeout.is_near(NO_DELAY) && TimeValue::now()-start>timeout){
@@ -126,12 +127,12 @@ public:
                  prints_new("Failed to accept connection, errno:", errno), return true;);
 
         socket_address client_fd_address = allocated_fd.remote_address();
-        local_address = allocated_fd.local_address();
+        ci.local_address = allocated_fd.local_address();
 
-        throw_if(client_fd_address != other_address,
-                 prints_new("Accept address mismatch: ", socket_address_to_string(client_fd_address), " != ", socket_address_to_string(other_address)));
+        throw_if(client_fd_address != ci.external_address,
+                 prints_new("Accept address mismatch: ", socket_address_to_string(client_fd_address), " != ", socket_address_to_string(ci.external_address)));
 
-        verbose_log(prints_new("Accepted connection from client: ", socket_address_to_string(other_address),
+        verbose_log(prints_new("Accepted connection from client: ", socket_address_to_string(ci.external_address),
                                " to server: ", socket_address_to_string(allocated_fd.local_address())));
         return false;
     }
@@ -166,21 +167,22 @@ public:
         }
         THROW_IF_RECOVERABLE(!success, prints_new("Failed to connect to server, errno:", errno), return true;);
 
-        other_address = address;
+        ci.external_address = address;
 
         socket_address server_fd_address = allocated_fd.remote_address();
-        local_address = allocated_fd.local_address();
+        ci.local_address = allocated_fd.local_address();
 
-        throw_if(server_fd_address != other_address,
-                 prints_new("Connect address mismatch: ", socket_address_to_string(server_fd_address), " != ", socket_address_to_string(other_address)));
+        throw_if(server_fd_address != ci.external_address,
+                 prints_new("Connect address mismatch: ", socket_address_to_string(server_fd_address), " != ", socket_address_to_string(ci.external_address)));
 
-        verbose_log(prints_new("Connected to server: ", socket_address_to_string(other_address),
+        verbose_log(prints_new("Connected to server: ", socket_address_to_string(ci.external_address),
                                " from client: ", socket_address_to_string(allocated_fd.local_address())));
         return false;
     }
     [[nodiscard]]
     ssize_t Send(const void *buf, size_t len, int flags)
     {
+        throw_if(!is_valid(), "Socket not valid on Send");
         num_send++;
         // return ::send(fd, buf, len, flags);
         return allocated_fd.Send(buf, len, flags);
@@ -188,9 +190,14 @@ public:
     [[nodiscard]]
     ssize_t Recv(void *buf, size_t len, int flags)
     {
+        throw_if(!is_valid(), "Socket not valid on Recv");
         num_recv++;
         // return ::recv(fd, buf, len, flags);
         return allocated_fd.Recv(buf, len, flags);
+    }
+    void close_fd()
+    {
+        allocated_fd.close_fd();
     }
 };
 

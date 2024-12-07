@@ -15,8 +15,11 @@
 
 namespace distribsys{
 
-constexpr int MAX_NONRESPONSE_HEARTBEART = 2;
-const std::string DIR_ROOT_DATA = "data/";
+//> how long until we timeout a client uuid
+extern const TimeValue CLIENT_REQUEST_TIMEOUT;//> 5s
+extern const int MAX_HEARTBEAT_RETRIES;//> 2
+extern const TimeValue HEARTBEAT_INTERVAL;//> =0.5s, 2/s
+extern const std::string DIR_ROOT_DATA;
 
 class Node{
     public:
@@ -30,6 +33,22 @@ class Node{
             continue;           \
         }                       \
     }
+
+
+// = SERVER structs
+// ================================================================
+
+//> DEFAULT/RETRY/PAUSED
+enum pause_state: u8{
+    //> normal state
+    DEFAULT,
+    //> same as normal state but set by backup node on restore
+    //> after successful connection, set back to DEFAULT
+    RETRY,
+    //> set to this state after a failed connection
+    //> also backup sets this state if it wants to pause the connection
+    PAUSED
+};
 //> has addresses of both ends in connection_info, unique_ptr of OpenSocket and TransmissionLayer
 //> also has the thread id of owner thread and a flag to request connection close
 struct connection_struct{
@@ -45,7 +64,23 @@ struct thread_struct{
     std::vector<sptr<connection_struct>> owned_connections;
     uptr<std::thread> thread;
     std::atomic<bool> request_close = false;
+
+    //> only useful with DATA nodes performing CLIENT communication with master
+    //> tells this thread if it should pause the retries, or if it should retry
+    std::mutex pause_mutex;
+    std::condition_variable pause_cv;
+    pause_state state = DEFAULT;
+    void set_state(pause_state state_){
+        state = state_;
+        //> no point in notifying if we are paused
+        if(state != PAUSED) pause_cv.notify_all();
+    }
 };
+
+
+// = SERVER class
+// ================================================================
+
 //> handles basic server things like .start() which starts listening for connections and spawns
 //> new threads (via setup_thread) to handle them. Derived classes should implement handle_first_connection()
 //> and may use remove_connection() for operations which span multiple connections
@@ -56,32 +91,34 @@ public:
 
     //> for accepting on the server socket
     std::mutex accept_mutex;
+
     //> for accessing connections, threads
     std::mutex connections_data_mutex;
     //> must hold connections_data_mutex to access
     std::unordered_map<connection_info, sptr<connection_struct>> connections;
     //> must hold connections_data_mutex to access
     std::unordered_map<std::thread::id, sptr<thread_struct>> threads;
+    //> used to wait until all threads have exited, use with connections_data_mutex
+    std::condition_variable can_exit_cv;
+
 
     //> used with finished_threads
     std::mutex finished_threads_mutex;
     //> not joining with finished threads is UB, so we keep track of them here
     std::vector<uptr<std::thread>> finished_threads;
     
-    //> intended to be used with can_exit_cv
-    std::mutex can_exit_mutex;
-    //> used to wait until all threads have exited
-    std::condition_variable can_exit_cv;
 
 
     //> used together with setup_cv to let things that must run after
     std::mutex setup_mutex;
     std::condition_variable setup_cv;
 
+    //> locks setup_mutex, later unlocks at start()
     Server(socket_address dns_address_, in_port_t port): Node(dns_address_), server_socket(port){
         //> lock setup_mutex, unlock at start
         setup_mutex.lock();
     }//server_socket constructor already starts listening
+    //> joins with all finished threads and removes them
     void cleanup_finished_threads(){
         std::lock_guard<std::mutex> lock(finished_threads_mutex);
         for(auto &thread: finished_threads){
@@ -89,6 +126,7 @@ public:
         }
         finished_threads.clear();
     }
+    //> begins accepting connections and spawning threads to handle them (via setup_thread)
     void start() {
         setup_mutex.unlock();//> let e.g. _setup_master run
         while (true)
@@ -103,7 +141,7 @@ public:
                 continue_on_err(open_socket->accept_connection(server_socket.get_socket_fd()));
             }
             
-            connection_info connection_info(open_socket->local_address, open_socket->other_address);
+            connection_info connection_info = open_socket->ci;
             sptr<connection_struct> connection = std::make_shared<connection_struct>();
             connection->open_socket = std::move(open_socket);
             connection->connection_info = connection_info;
@@ -147,30 +185,28 @@ public:
                 throw_if(connection.use_count() != 1,
                 "Connection still has other owners "+std::to_string(connection.use_count()));
             }
-
+            //> the reason its fine to clear vector after removing from connection is that
+            //> we are holding the lock the whole time
             this_thread->owned_connections.clear();
+
+            //> move the thread to finished_threads, must do so before erasing from threads
+            {
+                std::lock_guard<std::mutex> lock(finished_threads_mutex);
+                finished_threads.push_back(std::move(this_thread->thread));
+            }
             threads.erase(thread_id);
         }
         throw_if(this_thread.use_count() != 1,
         "Thread still has other owners: "+std::to_string(this_thread.use_count()));
-        
-        //> move the thread to finished_threads
-        {
-            std::lock_guard<std::mutex> lock(finished_threads_mutex);
-            finished_threads.push_back(std::move(this_thread->thread));
-        }
-        
         this_thread.reset();//> release the last ref of the struct
         can_exit_cv.notify_all();
     }
-    // std::lock_guard<std::mutex> lock(connections_data_mutex);
-    // uptr<std::thread> heartbeat_thread = std::make_unique<std::thread>(&DataNode::_setup_heartbeat, this, node);
-    // threads[heartbeat_thread->get_id()] = std::make_shared<thread_struct>();
-    // threads[heartbeat_thread->get_id()]->thread = std::move(heartbeat_thread);
 
     //! should be called while not holding connections_data_mutex
+    //> creates new thread using AutoCloseThreadTemplate(func, &connections_data_mutex)
+    //! Func MUST BE void Func(sptr<thread_struct>& this_thread)
     template<typename Func>
-    std::thread::id CreateNewThread(Func func){
+    std::thread::id CreateNewThread(const Func& func){
         std::lock_guard<std::mutex> lock(connections_data_mutex);
         uptr<std::thread> thread = std::make_unique<std::thread>(&Server::AutoCloseThreadTemplate<Func, std::mutex>, this, func, &connections_data_mutex);
         std::thread::id thread_id = thread->get_id();
@@ -179,9 +215,11 @@ public:
         return thread_id;
     }
     //! should be called while holding _setup_mutex
-    //> mutex_t should be a ptr to a mutex, e.g. either &mutex or sptr<mutex>
+    //* mutex_t should be a ptr to a mutex, e.g. either &mutex or sptr<mutex>, waits on it before starting
+    //> sets up the thread with auto remove_thread on exit, and calls func(this_thread)
+    //! Func MUST BE void Func(sptr<thread_struct>& this_thread)
     template<typename Func, typename mutex_t>
-    void AutoCloseThreadTemplate(Func func, mutex_t _setup_mutex){
+    void AutoCloseThreadTemplate(const Func& func, mutex_t _setup_mutex){
         {//> wait until setup completes
             std::lock_guard<std::mutex> lock(*_setup_mutex);
         }
@@ -204,16 +242,18 @@ public:
     //! should be called while not holding connections_data_mutex
     //* the alternative to this which creates SERVER socket, and the associated thread is found
     //* in the start() and setup_thread() functions
-    sptr<connection_struct> create_new_outgoing_connection(socket_address addr, std::thread::id owner_thread_id){
+    //> creates new CLIENT connection to addr and sets owner_thread_id
+    sptr<connection_struct> create_new_outgoing_connection(socket_address addr, std::thread::id owner_thread_id, sptr<thread_struct>& this_thread){
         uptr<OpenSocket> open_socket = std::make_unique<OpenSocket>(CLIENT);
         THROW_IF_RECOVERABLE(open_socket->connect_to_server(addr), "Failed to connect to server: "+socket_address_to_string(addr), return nullptr;);
-        connection_info connection_info(open_socket->local_address, open_socket->other_address);
+        connection_info connection_info = open_socket->ci;
         sptr<connection_struct> connection = std::make_shared<connection_struct>();
         uptr<TransmissionLayer> tl = std::make_unique<TransmissionLayer>(*open_socket);
         connection->open_socket = std::move(open_socket);
         connection->tl = std::move(tl);
         connection->connection_info = connection_info;
         connection->owner_thread_id = owner_thread_id;
+        this_thread->owned_connections.push_back(connection);
         {//> use connections_data_mutex because we are modifying connections and threads
             std::lock_guard<std::mutex> lock(connections_data_mutex);
             connections[connection_info] = connection;
@@ -221,9 +261,12 @@ public:
         return connection;
     }
 
+    //= SERVER setup_thread
+
     //% notice that connection is not a reference to the sptr, it is a new sptr
     //* after handle_first_connection, the only owner of this_thread should be this function so it can safely delete itself
-    //> Note: this already initializes the recv, meaning that the first message should always be sent by the client
+    //~ Note: this already initializes the recv, meaning that the first message should always be sent by the client
+    //> sets up a SERVER connection, then calls handle_first_connection
     void setup_thread(connection_info connection_info, sptr<connection_struct> connection){
         {//> wait until setup completes
             std::lock_guard<std::mutex> lock(connections_data_mutex);   
@@ -260,18 +303,17 @@ public:
     }
 
     //> returning from this function will cause the thread to exit and close any owned connections
-    virtual void handle_first_connection(sptr<thread_struct> this_thread) = 0;
+    virtual void handle_first_connection(sptr<thread_struct>& this_thread) = 0;
 
     ~Server(){
         {//> notify every thread to exit
-            std::lock_guard<std::mutex> lock(connections_data_mutex);
+            std::unique_lock<std::mutex> lock(connections_data_mutex);
             for(auto &thread: threads){
                 thread.second->request_close = true;
             }
+            //> wait for all threads to exit
+            can_exit_cv.wait(lock, [this](){return threads.empty();});
         }
-        //> wait for all threads to exit
-        std::unique_lock<std::mutex> lock(can_exit_mutex);
-        can_exit_cv.wait(lock, [this](){return threads.empty();});
         //> join with all finished threads
         cleanup_finished_threads();
     }
@@ -283,22 +325,33 @@ enum node_role{
     DATA
 };
 
+// = PACKETS
 // ================================================================
+
 //move from packets.h
 enum PACKET_ID : u8
 {
-    HEARTBEAT=0, // master -> data nodes
-    REQUEST_MASTER_ADDRESS=1,            // client -> dns
-    SET_MASTER_ADDRESS=2,                // master -> both dns and data nodes
-    REQUEST_LIST_OF_ALL_NODES=3,         // master -> dns
-    EDIT_LIST_OF_ALL_NODES=4,            // master -> dns
-    SET_DATA_NODE_AS_BACKUP=5,           // master -> data node
-    CLIENT_CONNECTION_REQUEST=6,         // client -> both to master and data nodes
-    DATA_NODE_TO_MASTER_CONNECTION_REQUEST=7, // data node -> master
-    MASTER_NODE_TO_DATA_NODE_REPLICATION_REQUEST=8, // master -> data node
-    DATA_NODE_TO_DATA_NODE_CONNECTION_REQUEST=9, // data node -> data node
-    MASTER_TO_DATA_NODE_INFO_REQUEST=10,  // master -> data node
-    MASTER_TO_DATA_NODE_PAUSE_CHANGE=11   // master -> data node
+    HEARTBEAT, // master -> data nodes
+    REQUEST_MASTER_ADDRESS,            // client -> dns
+    SET_MASTER_ADDRESS,                // master -> both dns and data nodes
+    REQUEST_LIST_OF_ALL_NODES,         // master -> dns
+    EDIT_LIST_OF_ALL_NODES,            // master -> dns
+    SET_DATA_NODE_AS_BACKUP,           // master -> data node
+    CLIENT_TO_MASTER_CONNECTION_REQUEST, // client -> master node
+    CLIENT_TO_DATA_CONNECTION_REQUEST, // client -> data node
+    DATA_NODE_TO_MASTER_CONNECTION_REQUEST, // data node -> master
+    MASTER_NODE_TO_DATA_NODE_REPLICATION_REQUEST, // master -> data node
+    DATA_NODE_TO_DATA_NODE_CONNECTION_REQUEST, // data node -> data node
+    MASTER_TO_DATA_NODE_INFO_REQUEST,  // master -> data node
+    MASTER_TO_DATA_NODE_PAUSE_CHANGE   // master -> data node
+};
+enum DATA_TO_MASTER_CASE : u8{
+    READ_FINISHED,
+    WRITE_FINISHED
+};
+enum CLIENT_REQUEST : u8{
+    READ_REQUEST,
+    WRITE_REQUEST
 };
 #define enum_case_to_string(x) case x: return #x;
 std::string packet_id_to_string(PACKET_ID packet_id){
@@ -309,7 +362,8 @@ std::string packet_id_to_string(PACKET_ID packet_id){
         enum_case_to_string(REQUEST_LIST_OF_ALL_NODES);
         enum_case_to_string(EDIT_LIST_OF_ALL_NODES);
         enum_case_to_string(SET_DATA_NODE_AS_BACKUP);
-        enum_case_to_string(CLIENT_CONNECTION_REQUEST);
+        enum_case_to_string(CLIENT_TO_MASTER_CONNECTION_REQUEST);
+        enum_case_to_string(CLIENT_TO_DATA_CONNECTION_REQUEST);
         enum_case_to_string(DATA_NODE_TO_MASTER_CONNECTION_REQUEST);
         enum_case_to_string(MASTER_NODE_TO_DATA_NODE_REPLICATION_REQUEST);
         enum_case_to_string(DATA_NODE_TO_DATA_NODE_CONNECTION_REQUEST);
@@ -320,11 +374,7 @@ std::string packet_id_to_string(PACKET_ID packet_id){
 }
 
 
-enum REQUEST : u8
-{
-    DOWNLOAD,
-    UPLOAD
-};
+
 //> append at the end of messages to communicate the dialogue status
 //> Note: initially the client owns the dialogue, so the first message should be from the client
 //> END_IMMEDIATELY/YOUR_TURN/ANOTHER_MESSAGE
@@ -340,15 +390,34 @@ enum DIALOGUE_STATUS : u8
 };
 
 static_assert(sizeof(PACKET_ID) == 1, "Packet ID must be 1 byte");
-static_assert(sizeof(REQUEST) == 1, "Request must be 1 byte");
+static_assert(sizeof(CLIENT_REQUEST) == 1, "Client request must be 1 byte");
+static_assert(sizeof(DIALOGUE_STATUS) == 1, "Dialogue status must be 1 byte");
+static_assert(sizeof(DATA_TO_MASTER_CASE) == 1, "DATA_TO_MASTER_CASE must be 1 byte");
 
-extern const TimeValue HEARTBEAT_INTERVAL;//> 2/s
 
 
+
+// = tl FUNCS
 // ================================================================
 
 //% all below true if error
 //> for a simple type like PACKET_ID just use read_type and write_type
+
+
+[[nodiscard]]
+bool read_string(TransmissionLayer &tl, std::string &str)
+{
+    i32 size;
+    if(tl.read_type(size)) return true;
+    str.resize(size);
+    return tl.read_bytes(str.data(), size);
+}
+[[nodiscard]]
+bool write_string(TransmissionLayer &tl, const std::string &str)
+{
+    if(tl.write_type(static_cast<i32>(str.size()))) return true;
+    return tl.write_bytes(str.data(), str.size());
+}
 
 [[nodiscard]]
 bool read_address(TransmissionLayer &tl, socket_address &addr)
@@ -395,7 +464,7 @@ bool write_vector(TransmissionLayer &tl, std::vector<T> &vec)
 //~ read_f(&tl, &vec_elem) should be bool and return true if error
 template<typename T, typename F>
 [[nodiscard]]
-bool read_vector_custom(TransmissionLayer &tl, std::vector<T> &vec, F read_f)
+bool read_vector_custom(TransmissionLayer &tl, std::vector<T> &vec, const F& read_f)
 {
     i32 size;
     if(tl.read_type(size)) return true;
@@ -410,7 +479,7 @@ bool read_vector_custom(TransmissionLayer &tl, std::vector<T> &vec, F read_f)
 //~ write_f(&tl, &vec_elem) should be bool and return true if error
 template<typename T, typename F>
 [[nodiscard]]
-bool write_vector_custom(TransmissionLayer &tl, std::vector<T> &vec, F write_f)
+bool write_vector_custom(TransmissionLayer &tl, std::vector<T> &vec, const F& write_f)
 {
     if(tl.write_type(static_cast<i32>(vec.size()))) return true;
     for(auto &elem: vec){
@@ -418,20 +487,47 @@ bool write_vector_custom(TransmissionLayer &tl, std::vector<T> &vec, F write_f)
     }
     return false;
 }
+template<typename T_key, typename T_val, typename F_key, typename F_val>
+[[nodiscard]]
+bool read_hashmap_custom(TransmissionLayer &tl, std::unordered_map<T_key, T_val> &umap, const F_key& read_key, const F_val& read_val)
+{
+    i32 size;
+    if(tl.read_type(size)) return true;
+    for(int i=0;i<size;i++){
+        T_key key;
+        T_val val;
+        if(read_key(tl, key)||read_val(tl, val)) return true;
+        umap[key] = val;
+    }
+    return false;
+}
+template<typename T_key, typename T_val, typename F_key, typename F_val>
+[[nodiscard]]
+bool write_hashmap_custom(TransmissionLayer &tl, std::unordered_map<T_key, T_val> &umap, const F_key& write_key, const F_val& write_val)
+{
+    if(tl.write_type(static_cast<i32>(umap.size()))) return true;
+    for(auto &pair: umap){
+        if(write_key(tl, pair.first)||write_val(tl, pair.second)) return true;
+    }
+    return false;
+}
 
+
+// = DNS
 // ================================================================
+
 //> DNS server, supposed to never fail
 //> Client asks for the master node address here, and a restored backup node asks for list of all nodes
 class DNS : public Server
 {
 public:
-    DNS():Server(socket_address(0,0,0,0,0), DNS_PORT){}
+    DNS():Server(socket_address(), DNS_PORT){}
 
     std::mutex mutexDNS;//* controls the below two variables
     socket_address addrCurMaster;
     std::unordered_set<socket_address> nodes;
 
-    void handle_first_connection(sptr<thread_struct> this_thread) override {
+    void handle_first_connection(sptr<thread_struct>& this_thread) override {
         // bool this_side_owns_connection = false; //> irrelevant because other side always owns connection with DNS
         while(true){
             //> first, read the packet id
@@ -511,36 +607,78 @@ public:
         }
     }
 };
+
+// = DATA NODE structs
 // ================================================================
-//> DEFAULT/RETRY/PAUSED
-enum pause_state{
-    //> normal state
-    DEFAULT,
-    //> same as normal state but set by master if before was PAUSED
-    //> after successful connection, set back to DEFAULT
-    RETRY,
-    //> set to this state after a failed connection
-    //> also master sets this state if it wants to pause the connection
-    PAUSED
-};
-struct file_info{
+
+struct master_file_info{
     int num_readers = 0;
     int num_writers = 0;
+    //> true if write query can be made
     bool not_write_blocked() const { return num_readers == 0 && num_writers == 0; }
+    //> true if read query can be made
     bool not_read_blocked() const { return num_writers == 0; }
     std::unordered_set<socket_address> replicas;
+    socket_address random_replica(){
+        if(replicas.empty()) return {};
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(0, replicas.size()-1);
+        auto it = replicas.begin();
+        std::advance(it, dis(gen));
+        return *it;
+    }
     // i64 version; //> irrelevant to consistently keep track of version from master
 };
-struct in_node_file_info{
+constexpr int s=sizeof(std::unordered_set<socket_address>);
+//> version, num_readers, num_writers
+struct data_file_info{
     i64 version=0;
     int num_readers=0;
     int num_writers=0;
 };
+[[nodiscard]]
+bool read_data_file_info(TransmissionLayer &tl, data_file_info &info){
+    return tl.read_type(info.version)||tl.read_type(info.num_readers)||tl.read_type(info.num_writers);
+}
+[[nodiscard]]
+bool write_data_file_info(TransmissionLayer &tl, data_file_info &info){
+    return tl.write_type(info.version)||tl.write_type(info.num_readers)||tl.write_type(info.num_writers);
+}
+//> total_readers, total_writers, hashmap<filename, data_file_info>
 struct node_info{
-    std::unordered_map<std::string, in_node_file_info> files;
     int total_readers = 0;
     int total_writers = 0;
+    std::unordered_map<std::string, data_file_info> files;
 };
+[[nodiscard]]
+bool read_node_info(TransmissionLayer &tl, node_info &info){
+    return tl.read_type(info.total_readers)||tl.read_type(info.total_writers)||
+    read_hashmap_custom(tl, info.files, read_string, read_data_file_info);
+}
+[[nodiscard]]
+bool write_node_info(TransmissionLayer &tl, node_info &info){
+    return tl.write_type(info.total_readers)||tl.write_type(info.total_writers)||
+    write_hashmap_custom(tl, info.files, write_string, write_data_file_info);
+}
+
+struct expected_client_entry{
+    std::string filename;
+    uuid_t uuid;
+    TimeValue timeout;
+    CLIENT_REQUEST request;
+};
+struct chached_client_entry{
+    std::string filename;
+    uuid_t uuid;
+    TimeValue timeout;
+    CLIENT_REQUEST request;
+    socket_address node_addr;
+};
+
+// = DATA NODE
+// ================================================================
+
 class DataNode: public Server
 {
 public:
@@ -553,35 +691,33 @@ public:
     socket_address addrMaster;
 
     //data node specific
-    //> if the outgoing connections to master are paused on the cv
-    pause_state paused = DEFAULT;
-    //> cv to pause the *outgoing* connections to master
-    std::condition_variable paused_cv;
-    //> to be used with cv, returns paused!=PAUSED
-    bool should_connect() const { return paused != PAUSED; }
     //> whether this node is the backup node, and so should rise to master if master fails
     bool is_backup = false;
     //> map from file name to version (also used as unordered set for filenames)
     std::unordered_map<std::string, i64> own_files;
+    //> master alerts data node about client requests that should arrive soon
+    std::queue<expected_client_entry> expected_client_requests;
+    node_info this_node_info;
 
 
     //master specific
     //> map from file name to list of data nodes
-    std::unordered_map<std::string, file_info> file_to_info;
+    std::unordered_map<std::string, master_file_info> file_to_info;
     //> map from data node to list of files
     std::unordered_map<socket_address, node_info> node_to_info;
     //> which node is the backup node
     socket_address backup_node;
+    std::queue<chached_client_entry> cached_client_requests;
 
     //> NOTE: even if role is master, nodes should still contain itself, otherwise it will not be used as a data node
     DataNode(socket_address dns_address_, in_port_t port, node_role initial_role):
     Server(dns_address_, port), role(initial_role){}
 
     //! call while holding m
-    socket_address random_non_master_node(){
+    socket_address random_non_master_node(socket_address _addrMaster){
         std::vector<socket_address> nodes_vec;
         for(auto &node: node_to_info){
-            if(node.first != addrMaster){
+            if(node.first != _addrMaster){
                 nodes_vec.push_back(node.first);
             }
         }
@@ -593,18 +729,36 @@ public:
         std::uniform_int_distribution<> dis(0, nodes_vec.size()-1);
         return nodes_vec[dis(gen)];
     }
+    //! call while holding m
+    socket_address random_node(){
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(0, node_to_info.size()-1);
+        auto it = node_to_info.begin();
+        std::advance(it, dis(gen));
+        return it->first;
+    }
+    //! call while holding m
+    void clear_timeout_client_requests(){
+        while(!cached_client_requests.empty()){
+            cached_client_requests.pop();
+        }
+    }
 
     //> should be called before start()
     void initial_setup_master_thread(std::vector<socket_address> &nodes_vec){
-        CreateNewThread([this, nodes_vec](){
-            setup_master(nodes_vec, false, {});
+        CreateNewThread([this, nodes_vec](sptr<thread_struct>& _this_thread){
+            setup_master(nodes_vec, false, {}, _this_thread);
         });
+        debug_log("Initial setup thread created");
     }
+
+    //= setup_master
+
     //> make new thread with nodes_vec, false, {} to do initial setup
     //> call with {}, true, last_master to do setup from backup node after a master failure
-    void setup_master(std::vector<socket_address> nodes_vec, bool from_backup, socket_address last_master){
-        //% notice that none of the below are THROW_IF_RECOVERABLE,
-        //% because it is expected that no failures happen during setup
+    void setup_master(std::vector<socket_address> nodes_vec, bool from_backup, socket_address last_master, sptr<thread_struct>& this_thread){
+        //% below doesn't use THROW_IF_RECOVERABLE because we don't handle if master setup or backup recovery fails
         {//> make sure this is run after the server has started
             std::lock_guard<std::mutex> setup_lock(setup_mutex);
         }
@@ -616,11 +770,11 @@ public:
         throw_if(addresses.empty(), "No network interfaces found");
 
         //> addrMaster has to point to self since master node is also a data node
-        addrMaster = socket_address(addresses[0], server_socket.get_port());
+        socket_address addrMaster_local = socket_address(addresses[0], server_socket.get_port());
 
         //> contact the DNS to set the master address
         {
-            sptr<connection_struct> dns_connection = create_new_outgoing_connection(dns_address, std::this_thread::get_id());
+            sptr<connection_struct> dns_connection = create_new_outgoing_connection(dns_address, std::this_thread::get_id(), this_thread);
 
             OnDelete on_delete_connection([&dns_connection, this](){
                 connection_info ci = dns_connection->connection_info;
@@ -645,7 +799,7 @@ public:
 
             //> set the master address
             throw_if(tl.write_type(SET_MASTER_ADDRESS), "Failed to write packet id");
-            throw_if(write_address(tl, addrMaster), "Failed to write address");
+            throw_if(write_address(tl, addrMaster_local), "Failed to write address");
             throw_if(tl.write_type(ANOTHER_MESSAGE), "Failed to write dialogue status");
             throw_if(tl.finalize_send(), "Failed to send address");
             
@@ -663,164 +817,157 @@ public:
         }
 
         //> contact each data node to set the master address, and pick one as backup
-        backup_node = random_non_master_node();
+        backup_node = random_non_master_node(addrMaster_local);
 
         //> avoid accessing the real ones without the lock
         socket_address backup_node_local = backup_node;
-        socket_address addrMaster_local = addrMaster;
-
 
         lock.unlock();//> can release now because already modified
         
-        //TODO: add pausing of all nodes + request the status of all nodes + unpause below
+        {
+            //> local hashmaps to avoid always locking
+            std::unordered_map<socket_address, node_info> node_to_info_local;
+            std::unordered_map<std::string, master_file_info> file_to_info_local;
 
+            for(socket_address &node: nodes_vec){
+                sptr<connection_struct> connection = create_new_outgoing_connection(node, std::this_thread::get_id(), this_thread);
+                OnDelete on_delete_connection([&connection, this](){
+                    connection_info ci = connection->connection_info;
+                    connection.reset();//> release the connection ref from this scope
+                    remove_connection(ci);
+                });
 
-        for(auto &node: nodes_vec){
-            OpenSocket open_socket(CLIENT);
-            //> do not THROW_IF_RECOVERABLE because it is expected that no failures happen during setup
-            throw_if(open_socket.connect_to_server(node), "Failed to connect to data node");
-            TransmissionLayer tl(open_socket);
-            throw_if(tl.write_type(SET_MASTER_ADDRESS), "Failed to write packet id");
-            throw_if(write_address(tl, addrMaster_local), "Failed to write address");
-            if(node == backup_node_local){
+                TransmissionLayer& tl=*connection->tl;
+                
+                if(from_backup){
+                    //> pause the node
+                    throw_if(tl.write_type(MASTER_TO_DATA_NODE_PAUSE_CHANGE), "Failed to write packet id");
+                    throw_if(tl.write_type(PAUSED), "Failed to write pause state");
+                    throw_if(tl.write_type(ANOTHER_MESSAGE), "Failed to write dialogue status");
+                    throw_if(tl.finalize_send(), "Failed to send pause request");
+                }
+                
+                //> set the master address
+                throw_if(tl.write_type(SET_MASTER_ADDRESS), "Failed to write packet id");
+                throw_if(write_address(tl, addrMaster_local), "Failed to write address");
                 throw_if(tl.write_type(ANOTHER_MESSAGE), "Failed to write dialogue status");
                 throw_if(tl.finalize_send(), "Failed to send address");
-                throw_if(tl.write_type(SET_DATA_NODE_AS_BACKUP), "Failed to write packet id");
-                throw_if(tl.write_type(END_IMMEDIATELY), "Failed to write dialogue status");
-                throw_if(tl.finalize_send(), "Failed to send backup request");
-            }else{
-                throw_if(tl.write_type(END_IMMEDIATELY), "Failed to write dialogue status");
-                throw_if(tl.finalize_send(), "Failed to send address");
+
+                if(node == backup_node_local){
+                    //> tell the node to set itself as backup
+                    throw_if(tl.write_type(SET_DATA_NODE_AS_BACKUP), "Failed to write packet id");
+                    if(from_backup){
+                        throw_if(tl.write_type(ANOTHER_MESSAGE), "Failed to write dialogue status");
+                    }else{
+                        throw_if(tl.write_type(END_IMMEDIATELY), "Failed to write dialogue status");
+                    }
+                    throw_if(tl.finalize_send(), "Failed to send backup request");
+                }
+                if(from_backup){
+                    //> get the node info
+                    throw_if(tl.write_type(MASTER_TO_DATA_NODE_INFO_REQUEST), "Failed to write packet id");
+                    throw_if(tl.write_type(END_IMMEDIATELY), "Failed to write dialogue status");
+                    throw_if(tl.finalize_send(), "Failed to send info request");
+
+                    throw_if(tl.initialize_recv(), "Failed to initialize recv");
+                    node_info info;
+                    throw_if(read_node_info(tl, info), "Failed to read node info");
+                    node_to_info_local[node] = info;
+                    for(auto &[filename, data_file_info]: info.files){
+                        file_to_info_local[filename].replicas.insert(node);
+                    }
+                }
+            }
+
+            if(from_backup){
+                //> now set everything
+                {
+                    lock.lock();
+                    node_to_info = std::move(node_to_info_local);
+                    file_to_info = std::move(file_to_info_local);
+                    addrMaster=addrMaster_local;
+                    lock.unlock();
+                }
+
+                //> now unpause
+                const pause_state new_pause_state = RETRY;
+                for(auto &node: nodes_vec){
+                    sptr<connection_struct> connection = create_new_outgoing_connection(node, std::this_thread::get_id(), this_thread);
+                    OnDelete on_delete_connection([&connection, this](){
+                        connection_info ci = connection->connection_info;
+                        connection.reset();//> release the connection ref from this scope
+                        remove_connection(ci);
+                    });
+
+                    TransmissionLayer& tl=*connection->tl;
+                    throw_if(tl.write_type(MASTER_TO_DATA_NODE_PAUSE_CHANGE), "Failed to write packet id");
+                    throw_if(tl.write_type(new_pause_state), "Failed to write pause state");
+                    throw_if(tl.write_type(END_IMMEDIATELY), "Failed to write dialogue status");
+                    throw_if(tl.finalize_send(), "Failed to send pause request");
+                } 
             }
         }
+
         //> set heartbeat with each one except for itself
         for(auto &node: nodes_vec){
             if(node == addrMaster_local) continue;
-            //> standard thread creation procedure
-            //===
-            std::lock_guard<std::mutex> lock(connections_data_mutex);
-            uptr<std::thread> heartbeat_thread = std::make_unique<std::thread>(&DataNode::_setup_heartbeat, this, node);
-            threads[heartbeat_thread->get_id()] = std::make_shared<thread_struct>();
-            threads[heartbeat_thread->get_id()]->thread = std::move(heartbeat_thread);
-            //===
+            CreateNewThread([this, node](sptr<thread_struct>& _this_thread){
+                _setup_heartbeat(node, _this_thread);
+            });
         }
-
     }
-    void _setup_heartbeat(socket_address addr){
-        {//> wait until got setup
-            std::lock_guard<std::mutex> lock(connections_data_mutex);
-        }
-        std::thread::id this_thread_id = std::this_thread::get_id();
-        sptr<thread_struct> this_thread;
-        //> makes it safe in case of a throw or early return, the thread will still be removed
-        OnDelete on_delete_thread([&this_thread,this_thread_id, this](){
-            this_thread.reset();
-            remove_thread(this_thread_id);
-        });
 
-        {//> check consistency and get this_thread
-            std::lock_guard<std::mutex> lock(connections_data_mutex);
-            throw_if(not_in(this_thread_id, threads), "Thread not found in threads map");
-            this_thread = threads[this_thread_id];
-        }
-        //> need loop to be able to break on error and also retry
-        bool error = false;
-        for(int i=0; i<MAX_HEARTBEAT_RETRIES; i++){
-            //> check if should exit
-            {
-                if(this_thread->request_close.load()){
-                    debug_log(std::string("Thread requested close") + LINE_LOCATION);
-                    return;
-                }
-            }
-            error = false;
-            //> standard outgoing socket creation procedure
-            //===
-            uptr<OpenSocket> open_socket = std::make_unique<OpenSocket>(CLIENT);
-            THROW_IF_RECOVERABLE(open_socket->connect_to_server(addr), "Failed to connect to data node", 
-            {error = true;break;});
-            connection_info connection_info(open_socket->local_address, open_socket->other_address);
-            sptr<connection_struct> connection = std::make_shared<connection_struct>();
-            connection->open_socket = std::move(open_socket);
-            connection->connection_info = connection_info;
-            {//> use connections_data_mutex because we are modifying connections and threads
-                std::lock_guard<std::mutex> lock(connections_data_mutex);
-                connections[connection_info] = connection;
-                connection->owner_thread_id = this_thread_id;
-                //% makes a copy of sptr connection
-                this_thread->owned_connections.push_back(connection);
-                //> do not release local connection since we use it immediately after
-            }
-            uptr<TransmissionLayer> _tl = std::make_unique<TransmissionLayer>(*connection->open_socket);
-            connection->tl = std::move(_tl);
-            //> no need for any further tl initialization since we are sending rather than receiving 
-            //===
-            OnDelete on_delete_connection([&connection, connection_info, this](){
+    //= _setup_heartbeat
+
+    void _setup_heartbeat(socket_address addr, sptr<thread_struct>& this_thread){
+
+        std::thread::id this_thread_id = std::this_thread::get_id();
+        {
+            sptr<connection_struct> connection = create_new_outgoing_connection(addr, this_thread_id, this_thread);
+            OnDelete on_delete_connection([&connection, this](){
+                connection_info ci = connection->connection_info;
                 connection.reset();//> release the connection ref from this scope
-                remove_connection(connection_info);
+                remove_connection(ci);
             });
             TransmissionLayer &tl = *connection->tl;
             bool own_connection=true;//> since we are the client
             while(true){
-                if(this_thread->request_close.load()){
-                    debug_log(std::string("Thread requested close") + LINE_LOCATION);
-                    return;
-                }
-                if(own_connection){
-                    THROW_IF_RECOVERABLE(tl.write_type(HEARTBEAT), "Failed to write packet id",
-                    {error = true;continue;});
-                    THROW_IF_RECOVERABLE(tl.write_type(YOUR_TURN), "Failed to write dialogue status",
-                    {error = true;continue;});
-                    THROW_IF_RECOVERABLE(tl.finalize_send(), "Failed to send heartbeat request",
-                    {error = true;continue;});
-                    own_connection = false;
-                    //> sleep for HEARTBEAT_INTERVAL
-                    std::this_thread::sleep_for(HEARTBEAT_INTERVAL.to_duration());
-                }else{
-                    THROW_IF_RECOVERABLE(tl.initialize_recv(), "Failed to initialize recv", {error = true; break;});
-                    PACKET_ID packet_id;
-                    THROW_IF_RECOVERABLE(tl.read_type(packet_id), "Failed to read packet id", {error = true; break;});
-                    THROW_IF_RECOVERABLE(packet_id != HEARTBEAT, "Invalid packet id: "+packet_id_to_string(packet_id), {error = true; break;});
-                    DIALOGUE_STATUS dialogue_status;
-                    THROW_IF_RECOVERABLE(tl.read_type(dialogue_status), "Failed to read dialogue status", {error = true; break;});
-                    THROW_IF_RECOVERABLE(dialogue_status!=YOUR_TURN, "Invalid dialogue status: "+std::to_string(dialogue_status), {error = true; break;});
-                    own_connection = true;
-                    //> sleep for 4/5th of HEARTBEAT_INTERVAL to account for network delay
-                    std::this_thread::sleep_for((HEARTBEAT_INTERVAL*0.8).to_duration());
-                }
 
+                if(own_connection){
+                    THROW_IF_RECOVERABLE(tl.write_type(HEARTBEAT), "Failed to write packet id", break;);
+                    THROW_IF_RECOVERABLE(tl.write_type(YOUR_TURN), "Failed to write dialogue status", break;);
+                    THROW_IF_RECOVERABLE(tl.finalize_send(), "Failed to send heartbeat request", break;);
+                    own_connection = false;
+                }else{
+                    THROW_IF_RECOVERABLE(tl.initialize_recv(), "Failed to initialize recv", break;);
+                    PACKET_ID packet_id;
+                    THROW_IF_RECOVERABLE(tl.read_type(packet_id), "Failed to read packet id", break;);
+                    THROW_IF_RECOVERABLE(packet_id != HEARTBEAT, "Invalid packet id: "+packet_id_to_string(packet_id), break;);
+                    DIALOGUE_STATUS dialogue_status;
+                    THROW_IF_RECOVERABLE(tl.read_type(dialogue_status), "Failed to read dialogue status", break;);
+                    THROW_IF_RECOVERABLE(dialogue_status!=YOUR_TURN, "Invalid dialogue status: "+std::to_string(dialogue_status), break;);
+                    own_connection = true;
+                }
+                //> sleep for HEARTBEAT_INTERVAL
+                std::this_thread::sleep_for(HEARTBEAT_INTERVAL.to_duration());
             }
         }
-        if(this_thread->request_close.load()){
-            debug_log(std::string("Thread requested close") + LINE_LOCATION);
-            return;
-        }
-        _handle_heartbeat_error(addr);
+        _handle_heartbeat_error(addr, this_thread, this_thread_id);
     }
+
+    //= _handle_heartbeat_error
+
     //> throw_if here since do not deal with inconsistent state
-    void _handle_heartbeat_error(socket_address addr){
+    void _handle_heartbeat_error(socket_address addr, sptr<thread_struct>& this_thread, std::thread::id this_thread_id){
         std::unique_lock<std::mutex> lock(m);
         auto it = node_to_info.find(addr);
         throw_if(it == node_to_info.end(), "Node not found in node_to_info");
         node_info &info = it->second;
         //> iterate through all files and remove the node from the list
-        // for(auto &file: info.files){
-        //     auto it2 = file_to_info.find(file.first);
-        //     throw_if(it2 == file_to_info.end(), "File not found in file_to_info");
-        //     file_info &file_info = it2->second;
-        //     auto it3 = file_info.replicas.find(addr);
-        //     throw_if(it3 == file_info.replicas.end(), "Node not found in file_info.replicas");
-        //     file_info.replicas.erase(it3);
-        //     file_info.num_readers -= file.second.num_readers;
-        //     file_info.num_writers -= file.second.num_writers;
-        //     if(file_info.replicas.empty()){
-        //         file_to_info.erase(it2);
-        //     }
-        // }
         for (const auto &[filename, in_node_info] : info.files) {
             auto it2 = file_to_info.find(filename);
             throw_if(it2 == file_to_info.end(), "File not found in file_to_info");
-            file_info &file_info = it2->second;
+            master_file_info &file_info = it2->second;
             auto it3 = file_info.replicas.find(addr);
             throw_if(it3 == file_info.replicas.end(), "Node not found in file_info.replicas");
             file_info.replicas.erase(it3);
@@ -833,529 +980,195 @@ public:
         //> remove the node from the list
         node_to_info.erase(it);
         if(addr == backup_node){
-            lock.unlock();
-            socket_address backup_node_local=random_non_master_node();
-            lock.lock();
+            socket_address backup_node_local=random_non_master_node(addrMaster);
             backup_node = backup_node_local;
-
+            lock.unlock();
+            sptr<connection_struct> connection = create_new_outgoing_connection(backup_node_local, this_thread_id, this_thread);
+            OnDelete on_delete_connection([&connection, this](){
+                connection_info ci = connection->connection_info;
+                connection.reset();//> release the connection ref from this scope
+                remove_connection(ci);
+            });
+            TransmissionLayer &tl = *connection->tl;
+            throw_if(tl.write_type(SET_DATA_NODE_AS_BACKUP), "Failed to write packet id");
+            throw_if(tl.write_type(END_IMMEDIATELY), "Failed to write dialogue status");
+            throw_if(tl.finalize_send(), "Failed to send backup request");
         }
     }
-
-    void writeFile(std::string &name, BYTES &data) {
-        std::ofstream wf(DIR_ROOT_DATA + name, std::ios::out | std::ios::binary);
-
-        throw_if(!wf, "Err: Cannot open file: " + name);
-
-        wf.write((char *)data.data(), data.size());
-
-        wf.close();
-    }
-
-    void consume() {
-        while (true)
-        {
-            std::unique_lock<std::mutex> lock(mutexPackets);
-            cv.wait(lock, [this] { return isPacketsReady; });
-
-            while (packets.size() > 0)
-            {
-                Packet packet = packets.front();
-                // norm_log("Consume packet : " + static_cast<int>(packet.packetID));
-                packets.pop();
-
-                switch (packet.packetID)
-                {
-                    case HEARTBEAT: {
-                        Packet packetHearbeatACK = Packet::compose_HEARTBEAT_ACK();
-                        packetHearbeatACK.send(addrMaster);
-
-                        break;
-                    }
-
-                    case ASK_IP_ACK: {
-                        std::lock_guard<std::mutex> lockGuard(mutexAddrMaster);
-
-                        addrMaster = packet.addrParsed;
-                        isAddrMasterReady = true;
-                        cv.notify_one();
-
-                        norm_log("DNS replies the current Master node address: " + socket_address_to_string(addrMaster));
-
-                        break;
-                    }
-
-                    case CLIENT_UPLOAD: {
-                        norm_log(prints_new("Client sent file with name: '",packet.fileName,"' and size = ",packet.binary.size()));
-
-                        // Write file
-                        writeFile(packet.fileName, packet.binary);
-
-                        // Send ACK back to Master
-                        Packet::compose_CLIENT_REQUEST_ACK(REQUEST::UPLOAD, packet.fileName).send(addrMaster);
-
-                        break;
-                    }
-
-                    case REQUEST_FROM_CLIENT: {
-                        // Read file
-                        std::string path = DIR_ROOT_DATA + packet.fileName;
-                        std::ifstream rf(path, std::ios::in | std::ios::binary);
-                        throw_if(!rf, "Err: Cannot open file: " + packet.fileName);
-                        
-                        std::vector<u8> binary((std::istreambuf_iterator<char>(rf)), (std::istreambuf_iterator<char>()));
-                        rf.close();
-
-                        // Send packet with binary
-                        socket_address addrClient = packet.addrSrc;
-                        addrClient = packet.addrSrc;
-                        addrClient.port = packet.addrParsed.port;
-
-                        Packet::compose_DATANODE_SEND_DATA(packet.fileName, binary).send(addrClient);
-
-                        // Send ACK back to Master
-                        Packet::compose_CLIENT_REQUEST_ACK(REQUEST::DOWNLOAD, packet.fileName).send(addrMaster);
-
-                        break;
-                    }
-                }
-            }
-            
-            isPacketsReady = false;
-        }
-    }
-
-    void doMiscTasks() {
-        // 1. Ask DNS about the socket of current Master
-        Packet packetDNSAskMaster = Packet::compose_ASK_IP(port);
-        packetDNSAskMaster.send(dns_address);
-
-        // 2. Notify the current MasterNode (if exist)
-        std::unique_lock<std::mutex> lock(mutexAddrMaster);
-        cv.wait(lock, [this] { return isAddrMasterReady; });
-
-        Packet packetNotifyMaster = Packet::compose_NOTIFY(NODE_TYPE::DATA, port);
-        packetNotifyMaster.send(addrMaster);
-        norm_log("Data sent NOTIFY to Master: " + socket_address_to_string(addrMaster));
-    }
-
-};
-
-// ================================================================
-class DataNodeInfo
-{
-public:
-    socket_address addr;
-    NODE_TYPE typeNode;
-    std::vector<std::string> files;
-
-    int numNonRespHeartBeat;
-    int numAvaiSlots = 100;
-
-    DataNodeInfo(NODE_TYPE typeNode, socket_address addr): typeNode(typeNode), addr(addr) {}
-};
-
-class FileInfo
-{
-public:
-    std::string name;
-    std::vector<DataNodeInfo *> nodesData;
-
-    FileInfo(DataNodeInfo *node){
-        nodesData.push_back(node);
-    }
-
-    void addDataNode(DataNodeInfo *node){
-        nodesData.push_back(node);
-    }
-};
-
-class MasterNode : public DataNode
-{
-public:
-    double durationHeartbeat;
-
-    std::map<std::string, DataNodeInfo> infoDataNodes;
-    bool isInfoDataNodeAvailable = false;
-    std::mutex mutexInfoDataNode;
-
-    std::map<std::string, FileInfo> infoFiles;
-
-    MasterNode(socket_address dns_address_, in_port_t port_, double durationHeartbeat_):
-    DataNode(dns_address_, port_), durationHeartbeat(durationHeartbeat_)
-    {}
-
-    std::string convAddr2Str(socket_address &addr){
-        return std::to_string(addr.ip.a)
-            + "-" + std::to_string(addr.ip.b)
-            + "-" + std::to_string(addr.ip.c)
-            + "-" + std::to_string(addr.ip.d);
-    }
-
-    void start(){
-        std::thread miscThread(&MasterNode::doMiscTasks, this);
-        std::thread listenThread(&MasterNode::listen, this);
-        std::thread consumeThread(&MasterNode::consume, this);
-        std::thread heartbeatThread(&MasterNode::sendHeartBeat, this);
-
-        miscThread.join();
-        listenThread.join();
-        heartbeatThread.join();
-        consumeThread.join();
-    }
-
-    DataNodeInfo* findBestDataNode(){
-        int bestAvaiSlot = 0;
-        DataNodeInfo *bestDataNode = nullptr;
-
-        for (auto& [key, info]: infoDataNodes) {
-            norm_log("Loop: " + key);
-
-            if (bestAvaiSlot < info.numAvaiSlots){
-                bestAvaiSlot = info.numAvaiSlots;
-                bestDataNode = &info;
-            }
-        }
-
-        return bestDataNode;
-    }
-
-    void consume() {
-        while (true)
-        {
-            std::unique_lock<std::mutex> lock(mutexPackets);
-            cv.wait(lock, [this] { return isPacketsReady; });
-
-            while (packets.size() > 0)
-            {
-                Packet packet = packets.front();
-                norm_log("Consume packet : " + static_cast<int>(packet.packetID));
-                packets.pop();
-
-                switch (packet.packetID)
-                {
-                    case HEARTBEAT_ACK: {
-                        norm_log("Master receives HEARTBEAT_ACK from Data node at: " + socket_address_to_string(packet.addrSrc));
-
-                        mutexInfoDataNode.lock();
-
-                        auto record = infoDataNodes.find(convAddr2Str(packet.addrSrc));
-                        if (record != infoDataNodes.end()) {
-                            DataNodeInfo& info = record->second;
-                            
-                            info.numNonRespHeartBeat--;
-                        }
-
-                        isInfoDataNodeAvailable = true;
-                        mutexInfoDataNode.unlock();
-
-                        break;
-                    }
-                    case NOTIFY: {
-                        norm_log("Master receives NOTIFY from Data node at: " + socket_address_to_string(packet.addrSrc));
-
-                        socket_address addrDataNode = packet.addrSrc;
-                        addrDataNode = packet.addrSrc;
-                        addrDataNode.port = packet.addrParsed.port;
-                        infoDataNodes.insert({convAddr2Str(addrDataNode), DataNodeInfo(NODE_TYPE::DATA, addrDataNode)});
-
-                        isInfoDataNodeAvailable = true;
-                        mutexInfoDataNode.unlock();
-                        break;
-                    }
-
-                    case CLIENT_REQUEST_ACK: {
-                        norm_log("Master receives CLIENT_REQUEST_ACK from Data node at: " + socket_address_to_string(packet.addrSrc));
-                        norm_log("filename: " + packet.fileName);
-                        norm_log("request: " + packet.request);
-
-                        switch (packet.request)
-                        {
-                            case REQUEST::UPLOAD: {
-                                std::string fileName = packet.fileName;
-                                // TODO: HoangLe [Nov-27]: Trigger replication with file packet.fileName 
-                                // Ideas: 
-                                //  1. use method findBestDataNode() to find best suitable node
-                                //  2. create packet and send it to the node holding the file to be replicated
-                                //  3. at the data node holding the file, send the packet embedded the file name and binary to the destined data node 
-                                //  4. both data nodes send ACK back to master
-
-                                break;
-                            }
-
-                            case REQUEST::DOWNLOAD : {
-                                // DO nothing
-                                break;
-                            }
-                            
-                            default:
-                                break;
-                        }
-
-                        break;
-                    }
-
-                    case REQUEST_FROM_CLIENT: {
-                        socket_address addrClient = packet.addrSrc;
-                        addrClient = packet.addrSrc;
-                        addrClient.port = packet.addrParsed.port;
-
-                        switch (packet.request)
-                        {
-                            case REQUEST::DOWNLOAD: {
-                                auto info = infoFiles.find(packet.fileName);
-                                if (info == infoFiles.end()) {
-                                    // File not exist, refuse downloading
-                                    norm_log("Cannot find Data node containing file '" + packet.fileName);
-
-                                    Packet::compose_RESPONSE_NODE_IP().send(addrClient);
-                                } else {
-                                    DataNodeInfo *nodeInfo = info->second.nodesData[0];
-                                    norm_log("Found Data node containing file '" + packet.fileName + "' : " + socket_address_to_string(nodeInfo->addr));
-                                    norm_log("Send Data node's IP to '" + socket_address_to_string(addrClient));
-
-                                    Packet::compose_RESPONSE_NODE_IP(nodeInfo->addr).send(addrClient);
-                                }
-
-                                break;
-                            }
-
-                            case REQUEST::UPLOAD: {
-                                auto info = infoFiles.find(packet.fileName);
-                                if (info == infoFiles.end()) {
-                                    // File not exist, allow write
-
-                                    DataNodeInfo *bestDataNode = findBestDataNode();
-                                    if (bestDataNode == nullptr) {
-                                        // Cannot find suitable Data Node to store file
-
-                                        norm_log("Cannot find suitable Data node");
-
-                                        Packet::compose_RESPONSE_NODE_IP().send(addrClient);
-                                    } else {
-                                        norm_log("Found suitable Data node: " + socket_address_to_string(bestDataNode->addr));
-
-                                        // Found suitable Data node, insert new entry
-                                        infoFiles.insert({packet.fileName, FileInfo(bestDataNode)});
-
-                                        Packet::compose_RESPONSE_NODE_IP(bestDataNode->addr).send(addrClient);
-                                    }
-
-                                } else {
-                                    // File exists -> refuse
-                                    norm_log("File existed: '" + packet.fileName + "'");
-                                    Packet::compose_RESPONSE_NODE_IP().send(addrClient);
-                                }
-
-                                break;
-                            }
-
-                            default:
-                                break;
-                        }
-
-                        break;
-                    }
-                }
-            }
-            
-            isPacketsReady = false;
-        }
-    }
-
-    void doMiscTasks() {
-        // 1. Notify DNS about the existence
-        Packet packetDNSNotify = Packet::compose_NOTIFY(NODE_TYPE::MASTER, port);
-        packetDNSNotify.send(dns_address);
-
-        // 2. Notify the current MasterNode (if exist)
-        // TODO: HoangLe [Nov-19]: Implement this
-    }
-
-    void sendHeartBeat() {
-        while (true)
-        {
-            std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int>(durationHeartbeat * 1000000)));
-
-            norm_log("Start sending heartbeat!");
-
-            mutexInfoDataNode.lock();
-
-            if (isInfoDataNodeAvailable == true) {
-                Packet packetHeartbeat = Packet::compose_HEARTBEAT();
-
-                for (auto& [key, info]: infoDataNodes) {
-                    info.numNonRespHeartBeat++;
-
-                    if (info.numNonRespHeartBeat >= MAX_NONRESPONSE_HEARTBEART) {
-                        norm_log("Trigger Replication with: " + socket_address_to_string(info.addr));
-                    }
-                    else {
-                        norm_log("Sent heartbeat to: " + socket_address_to_string(info.addr));
-
-                        try {
-                            packetHeartbeat.send(info.addr);
-                        }
-                        catch (const std::runtime_error& err) {
-                            norm_log("Cannot connect to: " + socket_address_to_string(info.addr));
-                        }
-                    }
-                }
-
-            }
-            mutexInfoDataNode.unlock();
-        }
-    }
-
-    void replicate() {
-        // TODO: HoangLe [Nov-26]: Implement this
-    }
-};
-
-
-
-// ================================================================
-
-class Client : public DataNode
-{
-public:
-    socket_address addrData;
-    std::mutex mutexAddrData;
-    bool isAddrDataReady = false;
-
-    Client(socket_address dns_address, in_port_t port):
-    DataNode(dns_address, port)
-    {}
-
-    void consume() {
-        while (true)
-        {
-            std::unique_lock<std::mutex> lock(mutexPackets);
-            cv.wait(lock, [this] { return isPacketsReady; });
-
-            while (packets.size() > 0)
-            {
-                Packet packet = packets.front();
-                packets.pop();
-
-                switch (packet.packetID)
-                {
-                    case ASK_IP_ACK: {
-                        std::lock_guard<std::mutex> lockGuard(mutexAddrMaster);
-
-                        addrMaster = packet.addrParsed;
-                        isAddrMasterReady = true;
-                        cv.notify_one();
-
-                        norm_log("DNS replies the current Master node address: " + socket_address_to_string(addrMaster));
-
-                        break;
-                    }
-
-                    case RESPONSE_NODE_IP: {
-                        std::lock_guard<std::mutex> lockGuard(mutexAddrData);
-
-                        addrData = packet.addrParsed;
-                        isAddrDataReady = true;
-                        cv.notify_one();
-
-                        norm_log("Master replies the Data node address: " + socket_address_to_string(addrData));
-
-                        break;
-                    }
-
-                    case DATANODE_SEND_DATA: {
-                        norm_log("Data node sends data for file: " + packet.fileName);
-
-
-                        std::string path = "received_" + packet.fileName;
-                        writeFile(path, packet.binary);
-
-                        std::exit(0);
-                        break;
-                    }
-                }
-            }
-            
-            isPacketsReady = false;
-        }
-    }
-
-    void uploadFile(std::string nameFile) {
-        std::thread listenThread(&Client::listen, this);
-        std::thread consumeThread(&Client::consume, this);
-
-        // 0. Read binary
-        std::ifstream rf(nameFile, std::ios::in | std::ios::binary);
-        throw_if(!rf, "Err: Cannot open file: " + nameFile);
-        
-        std::vector<u8> binary((std::istreambuf_iterator<char>(rf)), (std::istreambuf_iterator<char>()));
-        rf.close();
-
-        // 1. Connect to DNS to get current Master's ip and port
-        Packet packetDNSAskMaster = Packet::compose_ASK_IP(port);
-        packetDNSAskMaster.send(dns_address);
-
-        // 2. Connect to current Master
-        std::unique_lock<std::mutex> lock(mutexAddrMaster);
-        cv.wait(lock, [this] { return isAddrMasterReady; });
-        
-        Packet packetAskFile = Packet::compose_ASK_READ_WRITE(REQUEST::UPLOAD, nameFile, port);
-        packetAskFile.send(addrMaster);
     
-        // 3. Connect to assigned Data node
-        std::unique_lock<std::mutex> lock2(mutexAddrData);
-        cv.wait(lock2, [this] { return isAddrDataReady; });
+    //= handle_first_connection
 
-        if (addrData.port == 0) {
-            norm_log("No Data node available to upload file. Terminating...");
-            std::exit(0);
-        } else {    
-            norm_log("Found suitable Data node available to upload file");
-
-            Packet packetBinary = Packet::compose_CLIENT_UPLOAD(nameFile, binary);
-            packetBinary.send(addrData);
-
-            std::exit(0);
+    void handle_first_connection(sptr<thread_struct>& this_thread) override {
+        //> first, read the packet id
+        THROW_IF_RECOVERABLE(this_thread->owned_connections.empty(), "No connections", return;);
+        TransmissionLayer &tl = *this_thread->owned_connections.back()->tl;
+        while(true){
+            PACKET_ID packet_id;
+            THROW_IF_RECOVERABLE(tl.read_type(packet_id),"Failed to read packet id",return;);
+            //> only handle the -> data node ids
+            switch (packet_id){
+                case HEARTBEAT:
+                    handle_heartbeat(tl);//on data node
+                    break;
+                case SET_MASTER_ADDRESS:
+                    handle_set_master_address(tl);//on data node
+                    break;
+                case SET_DATA_NODE_AS_BACKUP:
+                    handle_set_data_node_as_backup(tl);//on data node
+                    break;
+                case CLIENT_TO_MASTER_CONNECTION_REQUEST:
+                    handle_client_to_master_connection_request(tl);//on master
+                    break;
+                case CLIENT_TO_DATA_CONNECTION_REQUEST:
+                    handle_client_to_data_connection_request(tl);//on data node
+                    break;
+                case DATA_NODE_TO_MASTER_CONNECTION_REQUEST:
+                    handle_data_node_to_master_connection_request(tl);//on master
+                    break;
+                case MASTER_NODE_TO_DATA_NODE_REPLICATION_REQUEST:
+                    handle_master_node_to_data_node_replication_request(tl);//on data node
+                    break;
+                case DATA_NODE_TO_DATA_NODE_CONNECTION_REQUEST:
+                    handle_data_node_to_data_node_connection_request(tl);//on data node
+                    break;
+                case MASTER_TO_DATA_NODE_INFO_REQUEST:
+                    handle_master_to_data_node_info_request(tl);//on data node
+                    break;
+                case MASTER_TO_DATA_NODE_PAUSE_CHANGE:
+                    handle_master_to_data_node_pause_change(tl);//on data node
+                    break;
+                default:
+                    THROW_IF_RECOVERABLE(true, "Invalid packet id:"+std::to_string(packet_id), return;);
+            }
+            if(packet_id == HEARTBEAT){
+                return;//> only in case heartbeat failed
+            }
+            DIALOGUE_STATUS dialogue_status;
+            THROW_IF_RECOVERABLE(tl.read_type(dialogue_status), "Failed to read dialogue status", return;);
+            if(dialogue_status==END_IMMEDIATELY){
+                return;
+            }else if(dialogue_status==YOUR_TURN){
+                THROW_IF_RECOVERABLE(tl.write_type(END_IMMEDIATELY), "Failed to write dialogue status", return;);
+                THROW_IF_RECOVERABLE(tl.finalize_send(), "Failed to send dialogue status", return;);
+                return;
+            }else if(dialogue_status!=ANOTHER_MESSAGE){
+                THROW_IF_RECOVERABLE(true, "Invalid dialogue status:"+std::to_string(dialogue_status), return;);
+            }
+            
         }
-
-        listenThread.join();
-        consumeThread.join();
     }
 
-    void downloadFile(std::string nameFile){
-        std::thread listenThread(&Client::listen, this);
-        std::thread consumeThread(&Client::consume, this);
+    //= handle_heartbeat
 
-        // 1. Connect to DNS to get current Master's ip and port
-        Packet packetDNSAskMaster = Packet::compose_ASK_IP(port);
-        packetDNSAskMaster.send(dns_address);
+    //> on data node
+    void handle_heartbeat(TransmissionLayer &tl){
+        //> read the first dialogue status
+        DIALOGUE_STATUS dialogue_status;
+        //> do while to be able to continue
+        do{
+            THROW_IF_RECOVERABLE(tl.read_type(dialogue_status), "Failed to read dialogue status", continue;);
+            THROW_IF_RECOVERABLE(dialogue_status!=YOUR_TURN, "First dialogue status should be YOUR_TURN", continue;);
+            bool own_connection = true;
+            //> do the first sleep
+            std::this_thread::sleep_for(HEARTBEAT_INTERVAL.to_duration());
+            while(true){
+                if(own_connection){
+                    THROW_IF_RECOVERABLE(tl.write_type(HEARTBEAT), "Failed to write packet id", break;);
+                    THROW_IF_RECOVERABLE(tl.write_type(YOUR_TURN), "Failed to write dialogue status", break;);
+                    THROW_IF_RECOVERABLE(tl.finalize_send(), "Failed to send heartbeat request", break;);
+                    own_connection = false;
+                }else{
+                    THROW_IF_RECOVERABLE(tl.initialize_recv(), "Failed to initialize recv", break;);
+                    PACKET_ID packet_id;
+                    THROW_IF_RECOVERABLE(tl.read_type(packet_id), "Failed to read packet id", break;);
+                    THROW_IF_RECOVERABLE(packet_id != HEARTBEAT, "Invalid packet id: "+packet_id_to_string(packet_id), break;);
+                    DIALOGUE_STATUS dialogue_status;
+                    THROW_IF_RECOVERABLE(tl.read_type(dialogue_status), "Failed to read dialogue status", break;);
+                    THROW_IF_RECOVERABLE(dialogue_status!=YOUR_TURN, "Invalid dialogue status: "+std::to_string(dialogue_status), break;);
+                    own_connection = true;
+                }
+                //> sleep for HEARTBEAT_INTERVAL
+                std::this_thread::sleep_for(HEARTBEAT_INTERVAL.to_duration());
+            }
+        }while(0);
 
-        // 2. Connect to current Master to ask the Data node holding file
-        std::unique_lock<std::mutex> lock(mutexAddrMaster);
-        cv.wait(lock, [this] { return isAddrMasterReady; });
-        
-        Packet packetAskFile = Packet::compose_ASK_READ_WRITE(REQUEST::DOWNLOAD, nameFile, port);
-        packetAskFile.send(addrMaster);
+        //> previously paused all threads here but that is unnecessary, rising to master does this anyway
 
-        // 3. Connect to assigned Data node
-        std::unique_lock<std::mutex> lock2(mutexAddrData);
-        cv.wait(lock2, [this] { return isAddrDataReady; });
-
-        if (addrData.port == 0) {
-            norm_log("No Data node storing the neeed file. Terminating...");
-            std::exit(0);
-        } else {    
-            norm_log("Found Data node having needed file");
-
-            Packet packetBinary = Packet::compose_ASK_READ_WRITE(REQUEST::DOWNLOAD, nameFile, port);
-            packetBinary.send(addrData);
-        }
-
-        listenThread.join();
-        consumeThread.join();
+        std::unique_lock<std::mutex> lock(m);
+        if(is_backup){
+            //> rise to master
+            socket_address addrMaster_local = addrMaster;
+            CreateNewThread([this, addrMaster_local](sptr<thread_struct>& _this_thread){
+                setup_master({}, true, addrMaster_local, _this_thread);
+            });
+        }        
     }
+
+    //> on data node
+    void handle_set_master_address(TransmissionLayer &tl){
+        socket_address addr;
+        THROW_IF_RECOVERABLE(read_address(tl, addr), "Failed to read address", return;);
+        std::lock_guard<std::mutex> lock(m);
+        addrMaster = addr;
+    }
+
+    //> on data node
+    void handle_set_data_node_as_backup(TransmissionLayer &tl){
+        std::lock_guard<std::mutex> lock(m);
+        is_backup = true;
+    }
+
+    //= handle_client_to_master_connection_request
+    void handle_client_to_master_connection_request(TransmissionLayer &tl){
+        //> read the case
+        CLIENT_REQUEST client_case;
+        THROW_IF_RECOVERABLE(tl.read_type(client_case), "Failed to read client case", return;);
+        if(client_case!=READ_REQUEST && client_case!=WRITE_REQUEST){
+            THROW_IF_RECOVERABLE(true, "Invalid client case: "+std::to_string(client_case), return;);
+        }
+        //> read the filename
+        std::string filename;
+        THROW_IF_RECOVERABLE(read_string(tl, filename), "Failed to read filename", return;);
+        //> check the request is allowed
+        bool allowed = false;
+        socket_address data_node;
+        {
+            std::lock_guard<std::mutex> lock(m);
+            auto it = file_to_info.find(filename);
+            if(client_case==READ_REQUEST){
+                if(it!=file_to_info.end()&&it->second.not_read_blocked()){
+                    allowed = true;
+                    data_node = it->second.random_replica();
+                }
+            }else if(client_case==WRITE_REQUEST){
+                if(it!=file_to_info.end()&&it->second.not_write_blocked()){
+                    allowed = true;
+                    data_node = it->second.random_replica();
+                }else if(it==file_to_info.end()){
+                    allowed = true;
+                    data_node = random_node();
+                    file_to_info[filename].replicas.insert(data_node);
+                }
+            }
+        }
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 };
+
+
 
 
 }//namespace distribsys

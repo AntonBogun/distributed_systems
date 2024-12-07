@@ -155,7 +155,7 @@ std::vector<ipv4_addr> getIPAddresses()
             inet_ntop(AF_INET, tmpAddrPtr, addressBuffer, INET_ADDRSTRLEN);
 
             // Skip localhost addresses
-            if (strcmp(addressBuffer, "127.0.0.1") != 0)
+            if (addressBuffer!="127.0.0.1")
             {
                 addresses.push_back(ipv4_addr::from_in_addr(sockaddr_in_ptr->sin_addr));
             }
@@ -167,7 +167,7 @@ std::vector<ipv4_addr> getIPAddresses()
         //     inet_ntop(AF_INET6, tmpAddrPtr, addressBuffer, INET6_ADDRSTRLEN);
 
         //     // Skip localhost addresses
-        //     if (strcmp(addressBuffer, "::1") != 0) {
+        //     if (
         //         addresses.push_back(addressBuffer);
         //     }
         // }
@@ -500,7 +500,24 @@ struct connection_info
         return ss.str();
     }
 };
-
+extern std::mutex uuid_gen_mutex;
+extern std::mt19937_64 uuid_gen;
+extern std::uniform_int_distribution<u64> uuid_dist;
+struct uuid_t
+{
+    u64 val;
+    uuid_t() : val(0){
+        std::lock_guard<std::mutex> lock(uuid_gen_mutex);
+        val = uuid_dist(uuid_gen);
+    }
+    uuid_t(u64 val_) : val(val_){}
+    bool operator==(uuid_t other) const {
+        return val == other.val;
+    }
+    bool operator!=(uuid_t other) const {
+        return !(*this == other);
+    }
+};
 
 }//namespace distribsys
 
@@ -528,6 +545,12 @@ namespace std{
     struct hash<distribsys::connection_info>{
         std::size_t operator()(const distribsys::connection_info& info) const noexcept{
             return std::hash<distribsys::socket_address>{}(info.local_address) ^ std::hash<distribsys::socket_address>{}(info.external_address);
+        }
+    };
+    template<>
+    struct hash<distribsys::uuid_t>{
+        std::size_t operator()(const distribsys::uuid_t& id) const noexcept{
+            return std::hash<distribsys::u64>{}(id.val);
         }
     };
 }
