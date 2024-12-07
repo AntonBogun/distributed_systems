@@ -668,13 +668,6 @@ struct expected_client_entry{
     TimeValue timeout;
     CLIENT_REQUEST request;
 };
-struct chached_client_entry{
-    std::string filename;
-    uuid_t uuid;
-    TimeValue timeout;
-    CLIENT_REQUEST request;
-    socket_address node_addr;
-};
 
 // = DATA NODE
 // ================================================================
@@ -707,7 +700,6 @@ public:
     std::unordered_map<socket_address, node_info> node_to_info;
     //> which node is the backup node
     socket_address backup_node;
-    std::queue<chached_client_entry> cached_client_requests;
 
     //> NOTE: even if role is master, nodes should still contain itself, otherwise it will not be used as a data node
     DataNode(socket_address dns_address_, in_port_t port, node_role initial_role):
@@ -740,7 +732,13 @@ public:
     }
     //! call while holding m
     void clear_timeout_client_requests(){
-        while(!cached_client_requests.empty()){
+        //> iterate through both queues and remove any that have timed out
+        TimeValue now = TimeValue::now();
+        while(!expected_client_requests.empty() && expected_client_requests.front().timeout < now){
+            expected_client_entry entry = expected_client_requests.front();
+            expected_client_requests.pop();
+        }
+        while(!cached_client_requests.empty() && cached_client_requests.front().timeout < now){
             cached_client_requests.pop();
         }
     }
