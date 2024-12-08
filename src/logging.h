@@ -39,7 +39,50 @@ namespace distribsys{
     #endif
     #define LINE_LOCATION " in " + __FILE__ + " at " + std::to_string(__LINE__)
 
+    #define throw_if(condition, message)                                          \
+    {                                                                             \
+        bool TMP_RET;                                                             \
+        try {                                                                     \
+            TMP_RET = condition;                                                  \
+        } catch (std::exception &e) {                                             \
+            throw std::runtime_error(std::string(e.what()) + " >>> " +            \
+                                std::string(message) + "; in file " + __FILE__ +  \
+                                " at line " + std::to_string(__LINE__));          \
+        }                                                                         \
+        if (TMP_RET) {                                                            \
+            throw std::runtime_error(std::string(message) +                       \
+                                        "; in file " + __FILE__ +                \
+                                        " at line " + std::to_string(__LINE__)); \
+        }                                                                         \
+    }
+    constexpr bool THROW_ON_RECOVERABLE = false;
+    //> This macro is used to handle recoverable errors in a consistent manner.
+    //> If THROW_ON_RECOVERABLE is defined, it will throw an exception on error.
+    //> Otherwise, it will log the error and execute a default action.
+    //> It also catches exceptions and rethrows them with additional context.
 
-
+    #define THROW_IF_RECOVERABLE(x, s, default_action)                        \
+    {                                                                         \
+        bool TMP_RET;                                                         \
+        try {                                                                 \
+            TMP_RET = x;                                                      \
+        } catch (std::exception &e) {                                         \
+            throw std::runtime_error(std::string(e.what()) + " >>> " +        \
+                                    std::string(s) +"; in file " + __FILE__ + \
+                                    " at line " + std::to_string(__LINE__));  \
+        }                                                                     \
+        if (TMP_RET) {                                                        \
+            if constexpr (THROW_ON_RECOVERABLE) {                             \
+                throw std::runtime_error(std::string(s) +                     \
+                                        "; in file " + __FILE__ +            \
+                                        " at line " + std::to_string(__LINE__)); \
+            } else {                                                          \
+                err_log(std::string(s) +                                      \
+                        "; in file " + __FILE__ +                             \
+                        " at line " + std::to_string(__LINE__));              \
+                default_action                                                \
+            }                                                                 \
+        }                                                                     \
+    }
 
 }//namespace distribsys

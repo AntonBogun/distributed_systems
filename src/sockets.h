@@ -1,7 +1,7 @@
 #pragma once
 
 #include "utils.h"
-
+#include "logging.h"
 #include <arpa/inet.h>
 #include <ctime>
 #include <ifaddrs.h>
@@ -18,22 +18,7 @@
 namespace distribsys{
 
 
-#define throw_if(condition, message)                                          \
-{                                                                             \
-    bool TMP_RET;                                                             \
-    try {                                                                     \
-        TMP_RET = condition;                                                  \
-    } catch (std::exception &e) {                                             \
-        throw std::runtime_error(std::string(e.what()) + " >>> " +            \
-                            std::string(message) + "; in file " + __FILE__ +  \
-                            " at line " + std::to_string(__LINE__));          \
-    }                                                                         \
-    if (TMP_RET) {                                                            \
-        throw std::runtime_error(std::string(message) +                       \
-                                     "; in file " + __FILE__ +                \
-                                     " at line " + std::to_string(__LINE__)); \
-    }                                                                         \
-}
+
 
 struct ipv4_addr
 {
@@ -205,6 +190,15 @@ public:
             fd=-1;
         }
     }
+    void graceful_close_fd(){
+        if(is_valid()){
+            DEBUG_PRINT("Closing fd: "+std::to_string(fd));
+            shutdown(fd, SHUT_RDWR);
+            DEBUG_PRINT("shutdown rdwr: "+std::to_string(fd));
+            close_fd();
+            DEBUG_PRINT("closed: "+std::to_string(fd));
+        }
+    }
     int get_fd() const {
         return fd;
     }
@@ -218,7 +212,7 @@ public:
     file_descriptor& operator=(file_descriptor&& other){
         if(this==&other) return *this;
         if(fd!=other.fd){
-            close_fd();
+            graceful_close_fd();
             fd=other.fd;
         }
         other.fd=-1;
@@ -226,7 +220,7 @@ public:
     }
     file_descriptor& operator=(int fd_){
         if(fd==fd_) return *this;
-        close_fd();
+        graceful_close_fd();
         fd=fd_;
         return *this;
     }
@@ -266,7 +260,7 @@ public:
     }
 
     ~file_descriptor(){
-        close_fd();
+        graceful_close_fd();
     }
 };
 std::string socket_address_to_string(socket_address addr)

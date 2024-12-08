@@ -375,14 +375,17 @@ public:
         }
         uptr<TransmissionLayer> tl = std::make_unique<TransmissionLayer>(*connection->open_socket);
 
+        connection->tl = std::move(tl);
         //% used to handle if recv failed here, effectively the connection wasn't established
         //* check definition of THROW_IF_RECOVERABLE
         //> also, tl->initialize_recv initializes the receive of the message, meaning that every connection from
         //> client -> server should always send a message from the client first
-        THROW_IF_RECOVERABLE(tl->initialize_recv(), "Failed to initialize recv", return;);
-
-        connection->tl = std::move(tl);
+        THROW_IF_RECOVERABLE(connection->tl->initialize_recv(), "Failed to initialize recv", {
+            connection.reset();
+            return;
+        });
         connection.reset();//release the connection ref from this scope
+
         
 
         handle_first_connection(this_thread);
@@ -461,6 +464,7 @@ enum class CLIENT_CONNECTION_END_STATE: u8{
     SUCCESS,
     FAILURE
 };
+constexpr u8 OK_REPONSE = 1;
 #define enum_case_to_string(x) case x: return #x
 std::string packet_id_to_string(PACKET_ID packet_id){
     switch (packet_id){
@@ -1512,10 +1516,20 @@ public:
                 //> send the vector of bytes
                 THROW_IF_RECOVERABLE(write_vector(tl, vec), "Failed to send file", break;);
                 THROW_IF_RECOVERABLE(tl.finalize_send(), "Failed to send file", break;);
+                //> read to avoid broken pipe
+                THROW_IF_RECOVERABLE(tl.initialize_recv(), "Failed to initialize recv", break;);
             }else{//WRITE_REQUEST
                 //> write the vector of bytes representing the file
                 std::vector<u8> vec;
-                THROW_IF_RECOVERABLE(read_vector(tl, vec), "Failed to receive file", break;);
+                THROW_IF_RECOVERABLE(tl.initialize_recv(), "Failed to initialize recv", break;);
+                THROW_IF_RECOVERABLE(read_vector(tl, vec), "Failed to receive file", {
+                    tl.print_errors();
+                    break;
+                });
+                //> write ok response to avoid broken pipe
+                THROW_IF_RECOVERABLE(tl.write_byte(OK_REPONSE), "Failed to write ok response", break;);
+                THROW_IF_RECOVERABLE(tl.finalize_send(), "Failed to send ok response", break;);
+
                 try{
                     ThrowingOfstream file(temp_filename, std::ios::binary);
                     file.write_from_byte_vector(vec);
@@ -1569,6 +1583,7 @@ public:
                 THROW_IF_RECOVERABLE(tl.write_type(PACKET_ID::DATA_NODE_TO_MASTER_CONNECTION_REQUEST), "Failed to write packet id", break;);
                 THROW_IF_RECOVERABLE(write_expected_client_entry(tl, *entry_sptr), "Failed to write expected client entry", break;);
                 THROW_IF_RECOVERABLE(tl.write_type(status), "Failed to write status", break;);
+                THROW_IF_RECOVERABLE(tl.write_type(DIALOGUE_STATUS::END_IMMEDIATELY), "Failed to write dialogue status", break;);
                 THROW_IF_RECOVERABLE(tl.finalize_send(), "Failed to notify master ndoe", break;);
                 failure=false;
             }while(0);
@@ -1723,6 +1738,7 @@ class ClientNode: public Node{
             throw_if(tl.write_type(PACKET_ID::CLIENT_TO_MASTER_CONNECTION_REQUEST), "Failed to write packet id");
             throw_if(tl.write_type(request), "Failed to write request");
             throw_if(write_string(tl, filename), "Failed to write filename");
+            throw_if(tl.write_type(DIALOGUE_STATUS::END_IMMEDIATELY), "Failed to write dialogue status");
             throw_if(tl.finalize_send(), "Failed to send request");
 
             throw_if(tl.initialize_recv(), "Failed to initialize recv");
@@ -1746,13 +1762,35 @@ class ClientNode: public Node{
             throw_if(write_string(tl, filename), "Failed to write filename");
             throw_if(tl.write_type(uuid.val), "Failed to write uuid");
             throw_if(tl.write_type(request), "Failed to write request");
+            throw_if(tl.finalize_send(), "Failed to send request");
+
+            //receive allow
+            DATA_DENY_REASON deny_reason;
+            throw_if(tl.initialize_recv(), "Failed to initialize recv");
+            throw_if(tl.read_type(deny_reason), "Failed to read deny reason");
+            if(deny_reason!=DATA_DENY_REASON::ALLOWED){
+                throw std::runtime_error("Read request denied for reason: "+data_deny_reason_to_string(deny_reason));
+            }
+
             if(request==CLIENT_REQUEST::READ_REQUEST){
+                throw_if(tl.write_type(DIALOGUE_STATUS::END_IMMEDIATELY), "Failed to write dialogue status");
                 throw_if(tl.finalize_send(), "Failed to send request");
+
                 throw_if(tl.initialize_recv(), "Failed to initialize recv");
                 throw_if(read_vector(tl, vec), "Failed to read file");
+
+                //> avoid broken pipe
+                throw_if(tl.write_byte(OK_REPONSE), "Failed to write ok response");
+                throw_if(tl.finalize_send(), "Failed to send ok response");
+
             }else if(request==CLIENT_REQUEST::WRITE_REQUEST){
                 throw_if(write_vector(tl, vec), "Failed to send file");
+                throw_if(tl.write_type(DIALOGUE_STATUS::END_IMMEDIATELY), "Failed to write dialogue status");
                 throw_if(tl.finalize_send(), "Failed to send file");
+
+                //> avoid broken pipe
+                throw_if(tl.initialize_recv(), "Failed to initialize recv");
+
             }else{
                 throw std::runtime_error("Invalid request type");
             }
