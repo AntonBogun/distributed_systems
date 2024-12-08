@@ -270,11 +270,11 @@ class ContinuousVector: public V_type {
 
 
 enum OffsetVectorOpts{
-    DEFAULT,
-    SET_MAX_SIZE
+    DEFAULT_OPT,
+    SET_MAX_SIZE_OPT
 };
 //non-owning vector
-//!Note: always sets size to 0 unless constructed from rvalue of another vector or given SET_MAX_SIZE
+//!Note: always sets size to 0 unless constructed from rvalue of another vector or given SET_MAX_SIZE_OPT
 template <typename T> class OffsetVector { // Fixed Capacity Vector
     static_assert(std::is_trivially_copyable_v<T>,"OffsetVector T must be trivially copyable");
     static_assert(std::is_standard_layout_v<T>, "OffsetVector T must be standard layout");
@@ -286,7 +286,7 @@ template <typename T> class OffsetVector { // Fixed Capacity Vector
   public:
 //   enum ConstructOptions{//~gave up on this
 //     DEFAULT,
-//     SET_MAX_SIZE,
+//     SET_MAX_SIZE_OPT,
 //   }
 
     using value_type = T;
@@ -319,7 +319,7 @@ template <typename T> class OffsetVector { // Fixed Capacity Vector
     template <typename V_type>
     explicit OffsetVector(V_type &v, const OffsetVectorOpts opt) :
     max_cap_(v.size()*sizeof(typename V_type::value_type)/sizeof(T)),
-    size_(opt==SET_MAX_SIZE?v.size()*sizeof(typename V_type::value_type)/sizeof(T):0),
+    size_(opt==SET_MAX_SIZE_OPT?v.size()*sizeof(typename V_type::value_type)/sizeof(T):0),
     ptr_(reinterpret_cast<T*>(v.data())),
     in_v_off_(0) {
         assert_compatible<V_type>();
@@ -329,7 +329,7 @@ template <typename T> class OffsetVector { // Fixed Capacity Vector
     template <typename V_type>
     explicit OffsetVector(V_type &in_v, u64 in_v_off, u64 in_v_cap) :
     max_cap_(in_v_cap*sizeof(typename V_type::value_type)/sizeof(T)),
-    // size_(opt==SET_MAX_SIZE?in_v_cap:0),
+    // size_(opt==SET_MAX_SIZE_OPT?in_v_cap:0),
     size_(0),
     ptr_(reinterpret_cast<T*>(in_v.data()+in_v_off)),
     in_v_off_(in_v_off) {
@@ -342,8 +342,8 @@ template <typename T> class OffsetVector { // Fixed Capacity Vector
     template <typename V_type>
     explicit OffsetVector(V_type &in_v, u64 in_v_off, u64 in_v_cap, const OffsetVectorOpts opt) :
     max_cap_(in_v_cap*sizeof(typename V_type::value_type)/sizeof(T)),
-    // size_(opt==SET_MAX_SIZE?in_v_cap:0),
-    size_(opt==SET_MAX_SIZE?in_v_cap*sizeof(typename V_type::value_type)/sizeof(T):0),
+    // size_(opt==SET_MAX_SIZE_OPT?in_v_cap:0),
+    size_(opt==SET_MAX_SIZE_OPT?in_v_cap*sizeof(typename V_type::value_type)/sizeof(T):0),
     ptr_(reinterpret_cast<T*>(in_v.data()+in_v_off)),
     in_v_off_(in_v_off) {
         assert_compatible<V_type>();
@@ -496,13 +496,44 @@ inline i64 index_of(const T& val, const V& vec){
     return -1;
 }
 
+
+//> note: this would work like OnDeleteMovable if return directly and not moved, but for safety use OnDeleteMovable
 template<typename f_type>
 class OnDelete {
     f_type f;
 public:
-    OnDelete(f_type f) : f(f) {}
+    OnDelete(f_type _f) : f(_f) {}
     ~OnDelete() {
         f();
+    }
+    OnDelete(const OnDelete&) = delete;
+    OnDelete& operator=(const OnDelete&) = delete;
+    OnDelete(OnDelete&& other) = delete;
+    OnDelete& operator=(OnDelete&& other) = delete;
+};
+//> like OnDelete but can be moved and wont call the function if moved
+template<typename f_type>
+class OnDeleteMovable {
+    f_type f;
+    bool valid=true;
+public:
+    OnDeleteMovable(f_type _f) : f(_f) {}
+    OnDeleteMovable(const OnDeleteMovable&) = delete;
+    OnDeleteMovable& operator=(const OnDeleteMovable&) = delete;
+    OnDeleteMovable(OnDeleteMovable&& other) : f(std::move(other.f)), valid(other.valid) {
+        other.valid=false;
+        std::cout<<"OnDeleteMovable moved called\n";
+    }
+    OnDeleteMovable& operator=(OnDeleteMovable&& other) {
+        f=std::move(other.f);
+        valid=other.valid;
+        other.valid=false;
+        return *this;
+    }
+    ~OnDeleteMovable() {
+        if(valid){
+            f();
+        }
     }
 };
 
@@ -640,12 +671,25 @@ class ThrowingOfstream : public std::ofstream {
     void write_v(const V_type &v) {
         write(reinterpret_cast<const char *>(v.data()), v.size() * sizeof(typename V_type::value_type));
     }
+    void write_from_byte_vector(const std::vector<u8> &v) {
+        write(reinterpret_cast<const char *>(v.data()), v.size());
+    }
 
 
     void write_string_with_size(const std::string &s) {
         size_t size = reinterpret_cast<size_t>(s.size());
         std::ofstream::write(reinterpret_cast<char *>(&size), sizeof(size_t));
         (*this) << s;
+    }
+    //should close the file before moving
+    static void move_to_file(const std::string &from, const std::string &to) {
+        if(from==to){
+            return;
+        }
+        if(check_file_exists(to)){
+            remove_file(to);
+        }
+        std::filesystem::rename(from, to);
     }
 };
 
@@ -689,7 +733,14 @@ class ThrowingIfstream : public std::ifstream {
         read(reinterpret_cast<char *>(&t), sizeof(T));
         return t;
     }
-
+    void read_into_byte_vector(std::vector<u8> &v) {
+        auto current = tellg();
+        seekg(0, std::ios::end);
+        auto size = tellg()-current;
+        v.resize(size);
+        seekg(current);
+        read(reinterpret_cast<char *>(v.data()), size);
+    }
 };
 
 // clang-format on

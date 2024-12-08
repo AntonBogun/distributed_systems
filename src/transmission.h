@@ -17,20 +17,32 @@
 namespace distribsys{
 
 constexpr bool THROW_ON_RECOVERABLE = false;
-//> this is used in the case when we'd like to setup debugging to throw on recoverable errors
-//> otherwise default action is taken, which should should correspond to silently handling the error
-//> also useful because it shows clearly in code that this is an error but recoverable
+//> This macro is used to handle recoverable errors in a consistent manner.
+//> If THROW_ON_RECOVERABLE is defined, it will throw an exception on error.
+//> Otherwise, it will log the error and execute a default action.
+//> It also catches exceptions and rethrows them with additional context.
+
 #define THROW_IF_RECOVERABLE(x, s, default_action)                        \
-if (x) {                                                                  \
-    if constexpr (THROW_ON_RECOVERABLE) {                                 \
-        throw std::runtime_error(std::string(s) +                         \
-                                 "; in file " + __FILE__ +                \
-                                 " at line " + std::to_string(__LINE__)); \
-    } else {                                                              \
-        err_log(std::string(s) +                                          \
-                "; in file " + __FILE__ +                                 \
-                " at line " + std::to_string(__LINE__));                  \
-        default_action                                                    \
+{                                                                         \
+    bool TMP_RET;                                                         \
+    try {                                                                 \
+        TMP_RET = x;                                                      \
+    } catch (std::exception &e) {                                         \
+        throw std::runtime_error(std::string(e.what()) + " >>> " +        \
+                                std::string(s) +"; in file " + __FILE__ + \
+                                " at line " + std::to_string(__LINE__));  \
+    }                                                                     \
+    if (TMP_RET) {                                                        \
+        if constexpr (THROW_ON_RECOVERABLE) {                             \
+            throw std::runtime_error(std::string(s) +                     \
+                                     "; in file " + __FILE__ +            \
+                                     " at line " + std::to_string(__LINE__)); \
+        } else {                                                          \
+            err_log(std::string(s) +                                      \
+                    "; in file " + __FILE__ +                             \
+                    " at line " + std::to_string(__LINE__));              \
+            default_action                                                \
+        }                                                                 \
     }                                                                     \
 }
 
@@ -346,10 +358,10 @@ class TransmissionLayer{
         std::memcpy(out_buf_at(0), &data_len, sizeof(int));//set data length
         std::memset(out_buf_at(sizeof(int)), batches_continue, sizeof(bool));//set batches continue
 
+        DEBUG_PRINT(prints_new("Sending batch: ", batches_sent, " with data length: ", data_len, " and continue: ", batches_continue));
         if(send_n(total_written)){
             return true;
         }
-        DEBUG_PRINT(prints_new("Sent batch: ", batches_sent, " with data length: ", data_len, " and continue: ", batches_continue));
         total_sent = 0;//reset total sent
         total_written = TRANSMISSION_LAYER_HEADER;//the header is reserved
 
@@ -532,6 +544,7 @@ class TransmissionLayer{
         throw_if(recv_batch_len!=MAX_DATA_SIZE && recv_batch_continue,
             prints_new("Invalid batch len while batches continue:", recv_batch_len));
 
+        DEBUG_PRINT(prints_new("Receiving batch: ", batches_received, " with data length: ", recv_batch_len, " and continue: ", recv_batch_continue));
         if(recv_n(recv_batch_len)){
             return true;
         }

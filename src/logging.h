@@ -26,18 +26,19 @@ namespace distribsys{
         prefix_log("==> HL: ", msg);
     }
     void debug_log(const std::string &msg){
-        prefix_log("==> HL: ", msg);
+        prefix_log("DEBUG: ", msg);
     }
     void err_log(const std::string &msg){
         prefix_log("==> ERR: ", msg);
     }
-    #define DEBUG_PRINTS 0
+    #define DEBUG_PRINTS 1
     #if DEBUG_PRINTS
     #define DEBUG_PRINT(x) debug_log(x)
     #else
     #define DEBUG_PRINT(x)
     #endif
     #define LINE_LOCATION " in " + __FILE__ + " at " + std::to_string(__LINE__)
+
 
 
 

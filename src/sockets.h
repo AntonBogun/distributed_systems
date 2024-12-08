@@ -13,15 +13,27 @@
 #include <unistd.h>
 #include <thread>
 #include <mutex>
+#include <cstring>
+#include <random>
 namespace distribsys{
 
-#define throw_if(condition, message)                                      \
-    if (condition)                                                        \
-    {                                                                     \
-        throw std::runtime_error(std::string(message) +                   \
-                                 "; in file " + __FILE__ +                \
-                                 " at line " + std::to_string(__LINE__)); \
-    }
+
+#define throw_if(condition, message)                                          \
+{                                                                             \
+    bool TMP_RET;                                                             \
+    try {                                                                     \
+        TMP_RET = condition;                                                  \
+    } catch (std::exception &e) {                                             \
+        throw std::runtime_error(std::string(e.what()) + " >>> " +            \
+                            std::string(message) + "; in file " + __FILE__ +  \
+                            " at line " + std::to_string(__LINE__));          \
+    }                                                                         \
+    if (TMP_RET) {                                                            \
+        throw std::runtime_error(std::string(message) +                       \
+                                     "; in file " + __FILE__ +                \
+                                     " at line " + std::to_string(__LINE__)); \
+    }                                                                         \
+}
 
 struct ipv4_addr
 {
@@ -155,7 +167,7 @@ std::vector<ipv4_addr> getIPAddresses()
             inet_ntop(AF_INET, tmpAddrPtr, addressBuffer, INET_ADDRSTRLEN);
 
             // Skip localhost addresses
-            if (addressBuffer!="127.0.0.1")
+            if (strcmp(addressBuffer, "127.0.0.1") != 0)
             {
                 addresses.push_back(ipv4_addr::from_in_addr(sockaddr_in_ptr->sin_addr));
             }
@@ -167,7 +179,7 @@ std::vector<ipv4_addr> getIPAddresses()
         //     inet_ntop(AF_INET6, tmpAddrPtr, addressBuffer, INET6_ADDRSTRLEN);
 
         //     // Skip localhost addresses
-        //     if (
+        //     if (strcmp(addressBuffer, "::1") != 0) {
         //         addresses.push_back(addressBuffer);
         //     }
         // }
@@ -268,6 +280,76 @@ std::string socket_address_to_string(struct sockaddr_in addr)
     std::stringstream ss;
     ss << ip_to_string(addr.sin_addr) << ":" << ntohs(addr.sin_port);
     return ss.str();
+}
+socket_address socket_address_from_string(const std::string& str) {
+    std::stringstream ss(str);
+    std::string ip;
+    std::getline(ss, ip, ':');
+    std::string port;
+    std::getline(ss, port, ':');
+
+    // Parse the IP address
+    std::stringstream ss_ip(ip);
+    int a, b, c, d;//% u8 instead reads characters instead of numbers
+    char dot;
+    ss_ip >> a >> dot >> b >> dot >> c >> dot >> d;
+
+    // Parse the port number
+    int port_num;
+    std::stringstream ss_port(port);
+    ss_port >> port_num;
+
+    return socket_address(a, b, c, d, port_num);
+}
+//> false on failure, set_addr != nullptr to set the address
+bool is_valid_socket_address(const std::string& str, socket_address* set_addr=nullptr) {
+std::stringstream ss(str);
+    std::string ip;
+    if (!std::getline(ss, ip, ':')) return false;
+    
+    std::string port;
+    if (!std::getline(ss, port, ':')) return false;
+    
+    // Check if there's anything left in the stream (would indicate extra colons)
+    std::string extra;
+    if (std::getline(ss, extra)) return false;
+    
+    // Validate and parse IP address
+    std::stringstream ss_ip(ip);
+    int a, b, c, d;
+    char dot;
+
+    bool failed=true;
+    do{
+        if(!(ss_ip >> a) || a < 0 || a > 255) break;
+        if(!(ss_ip >> dot) || dot != '.') break;
+        if(!(ss_ip >> b) || b < 0 || b > 255) break;
+        if(!(ss_ip >> dot) || dot != '.') break;
+        if(!(ss_ip >> c) || c < 0 || c > 255) break;
+        if(!(ss_ip >> dot) || dot != '.') break;
+        if(!(ss_ip >> d) || d < 0 || d > 255) break;
+        failed=false;
+    }while(0);
+    if(failed) return false;
+    
+    // Make sure there's nothing left after the IP
+    char extra_char;
+    if (ss_ip >> extra_char) return false;
+    
+    // Validate and parse port
+    int port_num;
+    try {
+        port_num = std::stoi(port);
+        if (port_num < 0 || port_num > 65535) return false;
+    } catch (...) {
+        return false;
+    }
+    
+    // return socket_address(static_cast<u8>(a), static_cast<u8>(b), static_cast<u8>(c), static_cast<u8>(d), static_cast<u16>(port_num));
+    if(set_addr!=nullptr){
+        *set_addr = socket_address(static_cast<u8>(a), static_cast<u8>(b), static_cast<u8>(c), static_cast<u8>(d), static_cast<u16>(port_num));
+    }
+    return true;
 }
 
 auto timenow()
@@ -472,7 +554,7 @@ public:
     {
         return socket_fd;
     }
-    const in_port_t get_port() const
+    in_port_t get_port() const
     {
         return port;
     }
@@ -511,11 +593,22 @@ struct uuid_t
         val = uuid_dist(uuid_gen);
     }
     uuid_t(u64 val_) : val(val_){}
+    uuid_t(const uuid_t& other) : val(other.val){}
+    uuid_t& operator=(const uuid_t& other){
+        if(this==&other) return *this;
+        val = other.val;
+        return *this;
+    }
     bool operator==(uuid_t other) const {
         return val == other.val;
     }
     bool operator!=(uuid_t other) const {
         return !(*this == other);
+    }
+    std::string to_string() const {
+        std::stringstream ss;
+        ss << std::hex << val;
+        return ss.str();
     }
 };
 

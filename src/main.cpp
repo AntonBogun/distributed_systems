@@ -2,7 +2,6 @@
 #include "transmission.h"
 #include "utils.h"
 #include "nodes.h"
-#include "packets.h"
 #include "logging.h"
 
 #include <algorithm>
@@ -15,6 +14,7 @@
 #include <thread>
 #include <vector>
 #include <endian.h>
+
 static_assert(BYTE_ORDER == LITTLE_ENDIAN, "This code only works on little-endian systems");
 
 namespace distribsys{
@@ -25,6 +25,10 @@ namespace distribsys{
     const TimeValue HEARTBEAT_INTERVAL = 0.5;
     const std::string DIR_ROOT_DATA = "data/";
     const TimeValue CLIENT_REQUEST_TIMEOUT = 5;
+
+    std::mutex uuid_gen_mutex;
+    std::mt19937_64 uuid_gen(std::random_device{}());
+    std::uniform_int_distribution<u64> uuid_dist;
 }
 
 using namespace distribsys;
@@ -224,27 +228,35 @@ int cerr_and_return(const std::string msg, int exit_code=error_exit_code) {
     std::cerr << msg << std::endl;
     return exit_code;
 }
-int main(int argc, char *argv[])
-{
-    return test();//./bin/main
-    // return node_main(argc, argv);
-}
 
+enum input_toggle{
+    DEFAULT_INPUT,
+    DATA_NODES_ADDRESSES
+};
 int node_main(int argc, char *argv[])
 {
     // Parse arguments
     int i = 1;
     std::string mode="";
     in_port_t port=0;
-    std::string nameFile = "";
+    //> name of file to upload or download
+    std::string filename = "";
+    //> name in distributed file system
+    std::string DFSname = "";
+    socket_address dnsAddress;
+    std::vector<socket_address> dataNodes;
     std::string action = "";
+    input_toggle input_state = DEFAULT_INPUT;
 
     std::unordered_set<std::string> valid_modes = {"client", "data", "master", "dns"};
 
     auto display_help = [&](){
-        printcout("Usage: ./main -mode <data|master|dns> -p <port_num>");
-        printcout("Usage: ./main -mode client -p <port_num> [--download monument.jpg | --upload monument.jpg]");
+        printcout("Usage: ./main -mode dns -p <port_num>");
+        printcout("Usage: ./main -mode data -p <port_num> -dns <dns_ip>:<dns_port>");
+        printcout("Usage: ./main -mode master -p <port_num> -dns <dns_ip>:<dns_port> -data_nodes <data_ip1>:<data_port1> <data_ip2>:<data_port2> ...");
+        printcout("Usage: ./main -mode client -dns <dns_ip>:<dns_port> [--download | --upload] <name_in_distributed_system> --file <file_path>");
     };
+
     if(argc==1) {
         display_help();
         return 0;
@@ -272,68 +284,98 @@ int node_main(int argc, char *argv[])
             if(action != "") return cerr_and_return("Err: duplicate action: " + s);
             action = s.substr(2);
             if(i>=argc) return cerr_and_return("Err: missing argument for " + s);
-            nameFile = argv[i++];
-        }else {
+            DFSname = argv[i++];
+        }else if (s == "--file") {
+            if(i>=argc) return cerr_and_return("Err: missing argument for --file");
+            filename = argv[i++];
+        }else if (s == "-dns") {
+            if(i>=argc) return cerr_and_return("Err: missing argument for -dns");
+            std::string dns_ip_port = argv[i++];
+            if(!is_valid_socket_address(dns_ip_port, &dnsAddress)) return cerr_and_return("Err: invalid DNS address: " + dns_ip_port);
+        }else if (s == "-data_nodes") {
+            input_state = DATA_NODES_ADDRESSES;
+        }else if(input_state == DATA_NODES_ADDRESSES){
+            socket_address dataNode;
+            if(!is_valid_socket_address(s, &dataNode)) return cerr_and_return("Err: invalid data node address: " + s);
+            dataNodes.push_back(dataNode);
+        }else{
             return cerr_and_return("Err: invalid argument: " + s);
         }
     }
-    if(port==0) return cerr_and_return("Err: missing port number");
+    if(mode!="dns"&&dnsAddress.is_unset()){
+        return cerr_and_return("Err: missing DNS address");
+    }
+    if(mode!="client"&&port==0){
+        return cerr_and_return("Err: missing port number");
+    }
     if(mode=="client"){
         if(action=="") return cerr_and_return("Err: client mode requires --download or --upload");
-        if(nameFile=="") return cerr_and_return("Err: client mode requires file path");
-        if(action=="upload" && !ThrowingIfstream::check_file_exists(nameFile)){
-            return cerr_and_return("Err: upload file not found: " + nameFile);
+        if(filename=="") return cerr_and_return("Err: client mode requires file path");
+        if(action=="upload" && !ThrowingIfstream::check_file_exists(filename)){
+            return cerr_and_return("Err: upload file not found: " + filename);
         }
-        if(action=="download" && !ThrowingOfstream::check_path_valid(nameFile)){
-            return cerr_and_return("Err: invalid download path: " + nameFile);
+        if(action=="download" && !ThrowingOfstream::check_path_valid(filename)){
+            return cerr_and_return("Err: invalid download path: " + filename);
         }
+        if(DFSname=="") return cerr_and_return("Err: client mode requires name in distributed system");
+    }else if(mode=="master"){
+        if(dataNodes.empty()) return cerr_and_return("Err: master mode requires data nodes");
     }
 
-    // Determine DNS's IP and port
-    std::vector<ipv4_addr> addresses = getIPAddresses();
-    if (addresses.empty())
-    {
-        throw std::runtime_error("No network interfaces found");
-    }
-    ipv4_addr ip = addresses[0];
-    socket_address dnsAddress(ip, DNS_PORT);
-
-
-    constexpr double DURATION_HEARBEAT = 2;     // in seconds;
-
-
-    if (mode == "client") {
-        norm_log("Enter client mode.");
-
-        Client client(dnsAddress, port);
-
-        if (action == "upload") {
-            client.uploadFile(nameFile);
-        } else if (action == "download") {
-            client.downloadFile(nameFile);
-        }
-    } else if (mode == "master")
-    {
-        norm_log("Enter master mode.");
-
-        DataNode master(dnsAddress, port, node_role::MASTER);
-        master.start();
-    } else if (mode == "data")
-    {
-        norm_log("Enter Data mode.");
-
-        DataNode data(dnsAddress, port,node_role::DATA);
-        data.start();
-
-    } else if (mode == "dns")
-    {
-        norm_log("Enter DNS mode.");
-
-        DNS dns;
+    if (mode == "dns"){
+        debug_log("Starting DNS server on port " + std::to_string(port));
+        DNS dns(port);
         dns.start();
-    }
+    }else{
+        debug_log("Using DNS address: " + socket_address_to_string(dnsAddress));
+        if(mode == "data"){
+            debug_log("Starting Data Node server on port " + std::to_string(port));
+            DataNode dataNode(dnsAddress, port, DATA);
+            dataNode.start();
+        }else if (mode == "master"){
+            debug_log("Starting Master Node server on port " + std::to_string(port));
+            std::stringstream ss;
+            for(auto &addr: dataNodes){
+                ss << socket_address_to_string(addr) << " ";
+            }
+            debug_log("Data Nodes: " + ss.str());
+
+            DataNode masterNode(dnsAddress, port, MASTER);
+            masterNode.initial_setup_master_thread(dataNodes);
+            masterNode.start();
+        }else if (mode == "client"){
+            debug_log("Starting Client Node on port " + std::to_string(port));
+            ClientNode client(dnsAddress);
+            std::vector<u8> vec;
+            if(action=="upload"){
+                debug_log("Uploading file: " + filename+ ", as " + DFSname);
+                //> read the file into a vector of bytes
+                {
+                    ThrowingIfstream file(filename, std::ios::binary);
+                    file.read_into_byte_vector(vec);
+                }
+                client.read_or_write_file(DFSname, CLIENT_REQUEST::WRITE_REQUEST, vec);
+            }else if(action=="download"){
+                debug_log("Downloading file: " + DFSname + ", to " + filename);
+                client.read_or_write_file(DFSname, CLIENT_REQUEST::READ_REQUEST, vec);
+                //> write the vector of bytes to a file
+                {
+                    ThrowingOfstream file(filename, std::ios::binary);
+                    file.write_from_byte_vector(vec);
+                }
+            }
+        }else{
+            return cerr_and_return("Err: invalid mode: " + mode);
+        }
+    } 
     
     return 0;
+}
+
+int main(int argc, char *argv[])
+{
+    // return test();//./bin/main
+    return node_main(argc, argv);
 }
 
 // g++ -std=c++17 -o main main.cpp -Wall -Wextra -Wshadow
