@@ -1,33 +1,25 @@
-# 1. Features
-- [Done] DNS: Master can sign up its IP + port and Data node can connect to get Master's IP and port
-- [Done] Heartbeat and Hearbeat_ACK
-- [Done] Client uploads/downloads file: Client first asks DNS for Master IP, then asks Master for Data node's IP then connects to that Data node
-
-# 2. System initialization
-
-Currently they are run on the same machine. Do in following orders:
-
 0. Compile
 > make
 
+1. Find out IP on each machine
+`python3 get_ip.py`
+
 1. Initialize DNS
-> ./bin/main -mode dns
+`./bin/main -mode dns -p 8089`
 
-2. Initialize Master
-> ./bin/main -mode master -p 52340
+2. Initialize Data nodes with dns ip and port
+`./bin/main -mode data -p 8090 -dns 128.214.9.26:8089`
 
-3. Initialize Data
-> ./bin/main -mode data -p 52345
+`./bin/main -mode data -p 8091 -dns 128.214.9.26:8089`
 
+3. Initialize Master with dns ip and port, and each data node's ip and port. The master node can be also a data node.
+`./bin/main -mode master -p 8092 -dns 128.214.9.26:8089 -data_nodes 128.214.9.25:8090 128.214.11.91:8091 128.214.9.26:8092`
 
-# 3. Steps
+4. Upload and download files with client
+`./bin/main -mode client -dns 128.214.9.26:8089 --upload file1 --file monument.jpg`
 
-## 3.1. Client uploads file
-Run command:
-> ./bin/main -mode client -p 52350 --upload monument.jpg
+`./bin/main -mode client -dns 128.214.9.26:8089 --download file1 --file monument2.jpg`
 
-## 3.2. Client downloads file
-Run command:
-> ./bin/main -mode client -p 52350 --download monument.jpg
+The two commands can be run from different machines.
 
-Note that, client must be upload before downloading that file
+The master node may crash between upload and download and it will still resolve the download correctly if the file wasn't uploaded to the master node.
