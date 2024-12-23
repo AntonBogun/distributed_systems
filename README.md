@@ -143,6 +143,7 @@ The `DataNode` class is a shared class for data nodes and the master node, since
     - `DATA_NODE_TO_MASTER_CONNECTION_REQUEST` - notifies the master node that the client connection has ended, releasing the lock in the form of the number of readers and writers for that file.
     - `MASTER_TO_DATA_NODE_INFO_REQUEST` - requests the data node to send its state information, used by the backup node to gather the file system state in case of master node failure.
     - `MASTER_TO_DATA_NODE_PAUSE_CHANGE` - used to pause or resume the data node activity, used by the backup node to effectively perform a distributed snapshot sequence during which it can safely request the information from the data nodes and handle the master node initialization. This is mostly implemented but the certainly could be edge cases where the PAUSE behaviour should apply to more connection types than it currently does (e.g. during replication).
+
 Almost all of the messages used within these handlers have a shared structure, which appends a byte to mark whose turn it is in the dialogue. This allows sending more messages one after another and not have to start a new connection for each message. 
 ### `Client`
 The client is a simple class that does read or write operations against the file system. It does the following sequence in both cases:
