@@ -1146,6 +1146,7 @@ public:
     //= _handle_heartbeat_error
 
     //> throw_if here since do not deal with inconsistent state
+    //TODO: update dns with new node list
     void _handle_heartbeat_error(socket_address addr, sptr<thread_struct>& this_thread, std::thread::id this_thread_id){
         DEBUG_PRINT("Handling heartbeat error with "+socket_address_to_string(addr));
         std::unique_lock<std::mutex> lock(datanode_mutex);
